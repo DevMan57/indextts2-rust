@@ -1,70 +1,76 @@
 # IndexTTS2 Rust Rewrite - Task Plan
 
-## Phase 1: Foundation [IN PROGRESS]
+## Phase 1: Foundation [COMPLETE]
 
 ### Config & Setup
-- [ ] **P1.1** Implement `src/config/model_config.rs` - YAML config parsing with serde
+- [x] **P1.1** Implement `src/config/model_config.rs` - YAML config parsing with serde
   - Parse `checkpoints/config.yaml` structure
   - Create `GptConfig`, `S2MelConfig`, `VocoderConfig` structs
   - Context7: `Context7:resolve-library-id "serde yaml"`
 
-### Text Processing  
-- [ ] **P1.2** Implement `src/text/tokenizer.rs` - BPE tokenization
+### Text Processing
+- [x] **P1.2** Implement `src/text/tokenizer.rs` - BPE tokenization
   - Use HuggingFace tokenizers crate
-  - Load `bpe.model` and `unigram_12000.vocab`
-  - Context7: `Context7:resolve-library-id "tokenizers huggingface"`
+  - Load tokenizer from JSON file, encode/decode text
+  - Added: encode_for_gpt(), vocab_size(), set_special_tokens()
 
-- [ ] **P1.3** Implement `src/text/normalizer.rs` - Text normalization
-  - Number to words conversion
-  - Punctuation handling
-  - Reference: `indextts/utils/front.py`
+- [x] **P1.3** Implement `src/text/normalizer.rs` - Text normalization
+  - Number to words conversion (integers, decimals, negatives)
+  - Abbreviation expansion (Dr., Mr., etc.)
+  - Punctuation and whitespace normalization
 
-- [ ] **P1.4** Implement `src/text/segmenter.rs` - Sentence segmentation
-  - Split text at max_text_tokens_per_segment=120
-  - Handle Chinese/English mixed text
+- [x] **P1.4** Implement `src/text/segmenter.rs` - Sentence segmentation
+  - Split at sentence boundaries (. ! ? and Chinese equivalents)
+  - Respect max_tokens limit with fallback to clause/word boundaries
+  - segment_text(), segment_text_string(), segment_mixed_text()
 
 ### Audio I/O
-- [ ] **P1.5** Implement `src/audio/loader.rs` - Audio file loading
-  - Support WAV, MP3, FLAC via symphonia
-  - Context7: `Context7:resolve-library-id "symphonia audio"`
+- [x] **P1.5** Implement `src/audio/loader.rs` - Audio file loading
+  - Support WAV, MP3, FLAC, OGG via symphonia
+  - Automatic resampling to target rate
+  - Mono conversion from stereo
 
-- [ ] **P1.6** Implement `src/audio/resampler.rs` - Sample rate conversion
-  - Resample to 16kHz for semantic, 22050Hz for vocoder
-  - Context7: `Context7:resolve-library-id "rubato"`
+- [x] **P1.6** Implement `src/audio/resampler.rs` - Sample rate conversion
+  - High-quality sinc interpolation via rubato
+  - Chunked processing for long audio
+  - Convenience methods: resample_to_16k(), resample_to_22k()
 
-- [ ] **P1.7** Implement `src/audio/mel.rs` - Mel spectrogram
-  - FFT via rustfft, mel filterbank
-  - 80 mel bands, hop_length=256
-  - Context7: `Context7:resolve-library-id "rustfft"`
+- [x] **P1.7** Implement `src/audio/mel.rs` - Mel spectrogram
+  - FFT via rustfft with cached planner
+  - 80 mel bands, librosa-compatible
+  - new_default() for IndexTTS2 parameters, compute_transposed()
 
-- [ ] **P1.8** Implement `src/audio/output.rs` - Audio playback
+- [x] **P1.8** Implement `src/audio/output.rs` - Audio playback
+  - WAV file saving (16-bit PCM, 32-bit float)
   - Real-time playback via cpal
-  - Context7: `Context7:resolve-library-id "cpal audio"`
+  - StreamingPlayer for real-time TTS output
 
 ---
 
-## Phase 2: Core Encoders [PENDING]
+## Phase 2: Core Encoders [COMPLETE]
 
 ### Semantic Encoder
-- [ ] **P2.1** Implement `src/models/semantic/wav2vec_bert.rs`
+- [x] **P2.1** Implement `src/models/semantic/wav2vec_bert.rs`
   - Wav2Vec-BERT 2.0 feature extraction
-  - Reference: `indextts/s2mel/wav2vecbert_extract.py`
-  - HuggingFace: `Hugging Face:model_search query="wav2vec-bert"`
+  - Self-attention, feed-forward, encoder layers
+  - Layer 17 extraction with normalization
 
-- [ ] **P2.2** Implement `src/models/semantic/codec.rs`
+- [x] **P2.2** Implement `src/models/semantic/codec.rs`
   - Vector quantization with 8192 codebook
-  - Reference: semantic_codec config in YAML
+  - L2 distance nearest neighbor search
+  - Projection layers for hidden_size/codebook_dim conversion
 
 ### Speaker Encoder
-- [ ] **P2.3** Implement `src/models/speaker/campplus.rs`
+- [x] **P2.3** Implement `src/models/speaker/campplus.rs`
   - CAMPPlus speaker embedding (192-dim output)
-  - Reference: `indextts/s2mel/modules/campplus/`
-  - DTDNN architecture
+  - D-TDNN architecture with dense connections
+  - Statistics pooling (mean + std)
 
 ### Emotion (Optional)
-- [ ] **P2.4** Implement `src/models/emotion/matrix.rs`
+- [x] **P2.4** Implement `src/models/emotion/matrix.rs`
   - 8 emotion categories matrix lookup
-  - Emotion blending with emo_alpha
+  - Emotion blending with configurable alpha
+  - Category-based and global index access
 
 ---
 
@@ -156,10 +162,10 @@
 
 ## Completion Tracking
 
-**Phase 1:** 0/8 complete  
-**Phase 2:** 0/4 complete  
-**Phase 3:** 0/5 complete  
-**Phase 4:** 0/4 complete  
-**Phase 5:** 0/4 complete  
+**Phase 1:** 8/8 complete ✅
+**Phase 2:** 4/4 complete ✅
+**Phase 3:** 0/5 complete
+**Phase 4:** 0/4 complete
+**Phase 5:** 0/4 complete
 
-**Total:** 0/25 tasks complete
+**Total:** 12/25 tasks complete

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check:*)",
+      "Bash(where cargo:*)",
+      "Bash($env:PATH += \";$env:USERPROFILE\\\\.cargo\\\\bin\")",
+      "Bash(cargo --version:*)",
+      "Bash(cmd /c \"cargo --version\")",
+      "Bash(cmd /c \"C:\\\\Users\\\\Henri Smith\\\\.cargo\\\\bin\\\\cargo.exe --version\")",
+      "Bash(powershell -Command \"& cargo check 2>&1\")",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+      "Bash(\"C:/Users/Henri Smith/.claude-membership/skills/ralph-wiggum/scripts/setup-ralph-loop.sh\" \"Implement Phase 2 from @fix_plan.md. Use Context7 to research Candle ML framework before coding. Phase 2 tasks: P2.1 Wav2Vec-BERT semantic encoder, P2.2 Semantic codec with VQ, P2.3 CAMPPlus speaker encoder, P2.4 Emotion matrix. Mark tasks [x] when complete in @fix_plan.md.\" --max-iterations 40 --completion-promise \"PHASE2_COMPLETE\")",
+      "mcp__brave-search__brave_web_search"
+    ]
+  }
+}

@@ -10,4 +10,4 @@ mod segmenter;
 
 pub use normalizer::TextNormalizer;
 pub use tokenizer::TextTokenizer;
-pub use segmenter::segment_text;
+pub use segmenter::{segment_text, segment_text_string, segment_mixed_text};
