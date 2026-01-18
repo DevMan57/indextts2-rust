@@ -141,21 +141,21 @@ s2mel:
 
 ## 🚀 Ralph Loop Commands by Phase
 
+### Completed Phases (1-6)
 ```bash
-# Phase 1: Foundation
-/ralph-loop "Implement Phase 1: Config, Text, Audio I/O, Mel spectrogram. Use Context7 for crate docs. Mark tasks [x] in @fix_plan.md." --max-iterations 30 --completion-promise "PHASE1_COMPLETE"
+# Phases 1-6 are complete - see @fix_plan.md
+```
 
-# Phase 2: Core Models
-/ralph-loop "Implement Phase 2: Semantic encoder, Speaker encoder. Use HuggingFace to find model architectures." --max-iterations 40 --completion-promise "PHASE2_COMPLETE"
+### Remaining Phases (7-9)
+```bash
+# Phase 7: Weight Loading
+/ralph-loop "Implement Phase 7 from @fix_plan_phase7.md. Convert PyTorch weights to safetensors and implement loading in Rust. Use Context7 for safetensors docs." --max-iterations 40 --completion-promise "PHASE7_COMPLETE"
 
-# Phase 3: GPT Generation
-/ralph-loop "Implement Phase 3: GPT-2 with Conformer, Perceiver, KV-cache. Focus on autoregressive generation." --max-iterations 50 --completion-promise "PHASE3_COMPLETE"
+# Phase 8: BigVGAN Vocoder
+/ralph-loop "Implement Phase 8 from @fix_plan_phase8.md. Download BigVGAN, convert weights, and integrate vocoder. Test mel-to-audio conversion." --max-iterations 35 --completion-promise "PHASE8_COMPLETE"
 
-# Phase 4: Synthesis
-/ralph-loop "Implement Phase 4: S2Mel DiT, Flow Matching (25 steps), BigVGAN vocoder." --max-iterations 50 --completion-promise "PHASE4_COMPLETE"
-
-# Phase 5: Integration
-/ralph-loop "Implement Phase 5: Full pipeline, CLI, streaming, tests." --max-iterations 30 --completion-promise "PROJECT_COMPLETE"
+# Phase 9: Testing & Polish
+/ralph-loop "Implement Phase 9 from @fix_plan_phase9.md. Fix test compilation, add comprehensive tests, and polish for production. Run all tests with cargo test." --max-iterations 40 --completion-promise "PHASE9_COMPLETE"
 ```
 
 ---
@@ -177,10 +177,17 @@ s2mel:
 
 Check `@fix_plan.md` for detailed task list.
 
-- [ ] Phase 1: Foundation (8 tasks)
-- [ ] Phase 2: Core Models (4 tasks)
-- [ ] Phase 3: Generation (5 tasks)
-- [ ] Phase 4: Synthesis (4 tasks)
-- [ ] Phase 5: Integration (4 tasks)
+### Completed
+- [x] Phase 1: Foundation (8 tasks)
+- [x] Phase 2: Core Models (4 tasks)
+- [x] Phase 3: Generation (5 tasks)
+- [x] Phase 4: Synthesis (4 tasks)
+- [x] Phase 5: Integration (4 tasks)
+- [x] Phase 6: Debug & Validate (11 tasks)
 
-**Total:** 0/25 tasks complete
+### Remaining
+- [ ] Phase 7: Weight Loading (8 tasks) - see `@fix_plan_phase7.md`
+- [ ] Phase 8: BigVGAN Vocoder (7 tasks) - see `@fix_plan_phase8.md`
+- [ ] Phase 9: Testing & Polish (12 tasks) - see `@fix_plan_phase9.md`
+
+**Total:** 36/63 tasks complete (57%)
