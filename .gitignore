@@ -1,0 +1,34 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model weights (too large for git)
+/checkpoints/*.pth
+/checkpoints/*.safetensors
+/checkpoints/*.bin
+/checkpoints/*.onnx
+!/checkpoints/.gitkeep
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+!/examples/*.wav
+
+# Logs
+/logs/
+*.log
+
+# Ralph
+status.json

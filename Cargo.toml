@@ -1,0 +1,115 @@
+[package]
+name = "indextts2"
+version = "0.1.0"
+edition = "2021"
+authors = ["Henri <henri@example.com>"]
+description = "High-performance Rust implementation of IndexTTS2 zero-shot text-to-speech"
+license = "Apache-2.0"
+repository = "https://github.com/DevMan57/indextts2-rust"
+keywords = ["tts", "speech-synthesis", "deep-learning", "voice-cloning", "audio"]
+categories = ["multimedia::audio", "science::ml"]
+
+[dependencies]
+# ML Framework (HuggingFace Candle)
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+
+# Tokenization
+tokenizers = "0.20"
+
+# Audio Processing
+cpal = "0.15"                   # Cross-platform audio I/O
+rodio = "0.19"                  # Audio playback
+rubato = "0.16"                 # Sample rate conversion
+rustfft = "6.2"                 # FFT for mel spectrograms
+hound = "3.5"                   # WAV file I/O
+symphonia = { version = "0.5", features = ["mp3", "flac", "ogg"] }
+
+# Configuration & Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+toml = "0.8"
+
+# Error Handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging & Diagnostics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+indicatif = "0.17"              # Progress bars
+console = "0.15"                # Terminal colors
+
+# Async Runtime
+tokio = { version = "1.42", features = ["full"] }
+tokio-stream = "0.1"
+
+# Parallelism
+rayon = "1.10"
+crossbeam = "0.8"
+
+# Numerics
+ndarray = "0.16"
+num-traits = "0.2"
+rand = "0.8"
+
+# File System
+walkdir = "2.5"
+tempfile = "3.14"
+memmap2 = "0.9"
+
+# HTTP (for model downloads)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# HuggingFace Hub
+hf-hub = "0.3"
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.5"
+approx = "0.5"
+insta = "1.41"
+
+[features]
+default = ["cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+mkl = ["candle-core/mkl", "candle-nn/mkl"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+
+[[bin]]
+name = "indextts2"
+path = "src/main.rs"
+
+[[example]]
+name = "basic_inference"
+path = "examples/basic_inference.rs"
+
+[[example]]
+name = "streaming_tts"
+path = "examples/streaming_tts.rs"
+
+[[example]]
+name = "emotion_control"
+path = "examples/emotion_control.rs"
+
+[[bench]]
+name = "inference_bench"
+harness = false
+path = "benches/inference_bench.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
+[profile.bench]
+inherits = "release"
