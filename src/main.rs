@@ -4,10 +4,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
-use tracing::{info, Level};
+use std::time::Instant;
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use indextts2::{IndexTTS2, ModelConfig, VERSION};
+use indextts2::inference::{InferenceConfig, StreamingSynthesizer};
 
 /// IndexTTS2 - High-performance zero-shot text-to-speech in Rust
 #[derive(Parser, Debug)]
@@ -66,6 +68,22 @@ enum Commands {
         /// Maximum text tokens per segment
         #[arg(long, default_value = "120")]
         max_tokens: usize,
+
+        /// Generation temperature (0.0-1.0)
+        #[arg(long, default_value = "0.8")]
+        temperature: f32,
+
+        /// Top-k sampling (0 = disabled)
+        #[arg(long, default_value = "50")]
+        top_k: usize,
+
+        /// Top-p (nucleus) sampling (1.0 = disabled)
+        #[arg(long, default_value = "0.95")]
+        top_p: f32,
+
+        /// Enable streaming output (play as generated)
+        #[arg(long)]
+        stream: bool,
     },
 
     /// Start streaming TTS server
@@ -136,23 +154,74 @@ fn main() -> Result<()> {
             emotion_vector,
             config,
             max_tokens,
+            temperature,
+            top_k,
+            top_p,
+            stream,
         } => {
+            // Validate inputs
+            if !speaker.exists() {
+                anyhow::bail!("Speaker audio file not found: {:?}", speaker);
+            }
+
             let pb = create_progress_bar("Loading model...");
-            
-            // TODO: Load model and perform inference
-            // let tts = IndexTTS2::new(&config, cli.cpu, cli.fp16)?;
-            // let audio = tts.infer(&text, &speaker, emotion_audio.as_ref(), emotion_alpha)?;
-            // audio.save(&output)?;
-            
-            pb.finish_with_message("Model loaded!");
-            
-            info!("Text: {}", text);
+            let start = Instant::now();
+
+            // Create inference config
+            let inference_config = InferenceConfig {
+                temperature,
+                top_k,
+                top_p,
+                use_gpu: !cli.cpu,
+                ..Default::default()
+            };
+
+            // Load model
+            let mut tts = IndexTTS2::with_config(&config, inference_config)
+                .context("Failed to load model config")?;
+
+            // Load weights if config directory has checkpoints
+            if let Some(model_dir) = config.parent() {
+                if model_dir.join("gpt.pth").exists() || model_dir.join("s2mel.pth").exists() {
+                    pb.set_message("Loading model weights...");
+                    tts.load_weights(model_dir)?;
+                } else {
+                    warn!("No model weights found in {:?}, using random initialization", model_dir);
+                }
+            }
+
+            pb.finish_with_message(format!("Model loaded in {:.1}s", start.elapsed().as_secs_f32()));
+
+            info!("Text: {} ({} chars)", &text[..text.len().min(50)], text.len());
             info!("Speaker: {:?}", speaker);
             info!("Output: {:?}", output);
-            
-            // Placeholder - actual implementation in inference module
-            eprintln!("🚧 Inference not yet implemented. See CLAUDE.md for implementation plan.");
-            
+
+            // Perform inference
+            let pb = create_progress_bar("Generating speech...");
+            let start = Instant::now();
+
+            let result = if emotion_audio.is_some() {
+                tts.infer_with_emotion(&text, &speaker, emotion_audio.as_ref())
+            } else {
+                tts.infer(&text, &speaker)
+            }
+            .context("Inference failed")?;
+
+            let duration = result.duration();
+            pb.finish_with_message(format!(
+                "Generated {:.1}s of audio in {:.1}s (RTF: {:.2}x)",
+                duration,
+                start.elapsed().as_secs_f32(),
+                duration / start.elapsed().as_secs_f32()
+            ));
+
+            // Save output
+            result.save(&output)
+                .context("Failed to save audio")?;
+
+            info!("Saved to {:?}", output);
+            info!("Generated {} mel codes", result.mel_codes.len());
+
             Ok(())
         }
 

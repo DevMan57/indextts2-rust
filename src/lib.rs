@@ -25,6 +25,7 @@
 
 pub mod audio;
 pub mod config;
+pub mod debug;
 pub mod inference;
 pub mod models;
 pub mod text;
