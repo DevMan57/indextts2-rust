@@ -8,11 +8,10 @@
 //! - Input: Raw audio waveform at 16kHz
 //! - Output: Semantic embeddings (batch, seq_len, 1024)
 
-use anyhow::{Context, Result};
-use candle_core::{safetensors, Device, Tensor, DType, IndexOp, D};
-use candle_nn::{Linear, Module, VarBuilder, LayerNorm, Embedding};
+use anyhow::Result;
+use candle_core::{safetensors, Device, Tensor, DType, D};
+use candle_nn::{Linear, Module, VarBuilder, LayerNorm};
 use std::path::Path;
-use std::collections::HashMap;
 
 /// Hidden dimension of Wav2Vec-BERT 2.0
 const HIDDEN_SIZE: usize = 1024;
@@ -197,7 +196,7 @@ impl SemanticEncoder {
     /// * `stat_path` - Path to wav2vec2bert_stats.pt containing mean/std
     /// * `model_path` - Optional path to model weights (if None, uses placeholder)
     /// * `device` - Device to load tensors on
-    pub fn load<P: AsRef<Path>>(stat_path: P, model_path: Option<P>, device: &Device) -> Result<Self> {
+    pub fn load<P: AsRef<Path>>(stat_path: P, _model_path: Option<P>, device: &Device) -> Result<Self> {
         // Load normalization statistics
         let (mean, std) = Self::load_stats(stat_path.as_ref(), device)?;
 
@@ -277,7 +276,7 @@ impl SemanticEncoder {
             proj.forward(input_features)?
         } else {
             // Placeholder: just reshape/pad to hidden size if no projection loaded
-            let (batch, seq, feat_dim) = input_features.dims3()?;
+            let (_batch, _seq, feat_dim) = input_features.dims3()?;
             if feat_dim == HIDDEN_SIZE {
                 input_features.clone()
             } else {

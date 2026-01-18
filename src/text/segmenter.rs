@@ -33,7 +33,7 @@ pub fn segment_text(tokens: &[String], max_tokens: usize, quick_streaming_tokens
     let mut segments = Vec::new();
     let mut current_segment = Vec::new();
 
-    for (i, token) in tokens.iter().enumerate() {
+    for (_i, token) in tokens.iter().enumerate() {
         current_segment.push(token.clone());
 
         // Check if we should split here

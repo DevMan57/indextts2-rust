@@ -10,9 +10,9 @@
 //! - Feed-forward module (half-step residual)
 //! - Layer normalization
 
-use anyhow::{Context, Result};
-use candle_core::{Device, Tensor, DType, D, IndexOp};
-use candle_nn::{Linear, Module, VarBuilder, LayerNorm, Embedding};
+use anyhow::Result;
+use candle_core::{Device, Tensor, DType, D};
+use candle_nn::{Linear, Module, VarBuilder, LayerNorm};
 use std::path::Path;
 
 /// Swish activation function: x * sigmoid(x)

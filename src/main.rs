@@ -9,7 +9,7 @@ use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use indextts2::{IndexTTS2, ModelConfig, VERSION};
-use indextts2::inference::{InferenceConfig, StreamingSynthesizer};
+use indextts2::inference::InferenceConfig;
 
 /// IndexTTS2 - High-performance zero-shot text-to-speech in Rust
 #[derive(Parser, Debug)]
@@ -100,7 +100,7 @@ enum Commands {
     /// Download model weights from HuggingFace
     Download {
         /// Model version to download (1.5 or 2)
-        #[arg(short, long, default_value = "2")]
+        #[arg(long, default_value = "2")]
         version: String,
 
         /// Output directory for checkpoints
@@ -150,14 +150,14 @@ fn main() -> Result<()> {
             speaker,
             output,
             emotion_audio,
-            emotion_alpha,
-            emotion_vector,
+            emotion_alpha: _,
+            emotion_vector: _,
             config,
-            max_tokens,
+            max_tokens: _,
             temperature,
             top_k,
             top_p,
-            stream,
+            stream: _,
         } => {
             // Validate inputs
             if !speaker.exists() {
@@ -225,7 +225,7 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Serve { port, config } => {
+        Commands::Serve { port, config: _ } => {
             info!("Starting TTS server on port {}", port);
             // TODO: Implement HTTP/WebSocket server
             eprintln!("🚧 Server mode not yet implemented.");

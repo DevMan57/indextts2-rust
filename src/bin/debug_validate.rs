@@ -6,13 +6,13 @@
 //!     cargo run --bin debug_validate -- --golden-dir golden/ --component all
 //!     cargo run --bin debug_validate -- --golden-dir golden/ --component gpt --verbose
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use candle_core::{Device, Tensor, DType};
 use std::path::PathBuf;
 
 use indextts2::debug::{Validator, ValidationConfig};
-use indextts2::text::{TextNormalizer, TextTokenizer};
+use indextts2::text::TextNormalizer;
 use indextts2::audio::MelSpectrogram;
 use indextts2::models::semantic::SemanticEncoder;
 use indextts2::models::speaker::CAMPPlus;
@@ -145,7 +145,7 @@ fn validate_tokenizer(validator: &mut Validator) -> Result<()> {
     println!("Validating tokenizer...");
 
     // Load golden tokens
-    let golden_path = validator.results().first().map(|_| ());
+    let _golden_path = validator.results().first().map(|_| ());
 
     // For now, just check shape
     let tokens: Vec<i64> = vec![0; 10]; // Placeholder
@@ -154,11 +154,11 @@ fn validate_tokenizer(validator: &mut Validator) -> Result<()> {
     Ok(())
 }
 
-fn validate_mel(validator: &mut Validator) -> Result<()> {
+fn validate_mel(_validator: &mut Validator) -> Result<()> {
     println!("Validating mel spectrogram...");
 
     // Load golden audio and compute mel
-    let mel_extractor = MelSpectrogram::new(1024, 256, 1024, 80, 22050, 0.0)?;
+    let mel_extractor = MelSpectrogram::new(1024, 256, 1024, 80, 22050, 0.0, None);
 
     // Placeholder validation
     let samples = vec![0.0f32; 22050];
@@ -176,7 +176,7 @@ fn validate_speaker(validator: &mut Validator, device: &Device) -> Result<()> {
 
     // Load golden audio
     let audio = Tensor::randn(0.0f32, 1.0, (1, 16000), device)?;
-    let emb = encoder.forward(&audio)?;
+    let emb = encoder.encode(&audio)?;
 
     validator.validate_tensor("speaker_emb", &emb, "encoders")?;
     Ok(())
@@ -185,11 +185,12 @@ fn validate_speaker(validator: &mut Validator, device: &Device) -> Result<()> {
 fn validate_semantic(validator: &mut Validator, device: &Device) -> Result<()> {
     println!("Validating semantic encoder...");
 
-    let mut encoder = SemanticEncoder::new(device)?;
-    encoder.initialize_random()?;
+    // SemanticEncoder requires a stats file path - use a placeholder
+    let dummy_stat_path = std::path::PathBuf::from("checkpoints/w2v_stat.npy");
+    let encoder = SemanticEncoder::load(&dummy_stat_path, None::<&std::path::PathBuf>, device)?;
 
     let audio = Tensor::randn(0.0f32, 1.0, (1, 16000), device)?;
-    let features = encoder.forward(&audio)?;
+    let features = encoder.encode(&audio, None)?;
 
     validator.validate_tensor("semantic_feat", &features, "encoders")?;
     Ok(())
@@ -203,7 +204,8 @@ fn validate_gpt(validator: &mut Validator, device: &Device) -> Result<()> {
 
     // Create dummy input
     let text_ids = Tensor::zeros((1, 10), DType::I64, device)?;
-    let _output = gpt.forward(&text_ids)?;
+    let mel_ids = Tensor::zeros((1, 5), DType::I64, device)?;
+    let _output = gpt.forward(&text_ids, &mel_ids, None)?;
 
     // Validate layer outputs
     // These would be captured with hooks in a real implementation
@@ -262,16 +264,18 @@ fn validate_vocoder(validator: &mut Validator, device: &Device) -> Result<()> {
     Ok(())
 }
 
-fn validate_full(validator: &mut Validator, device: &Device) -> Result<()> {
+fn validate_full(_validator: &mut Validator, device: &Device) -> Result<()> {
     println!("Validating full pipeline...");
 
     // This would run the complete pipeline and compare final output
     // For now, validate that all components can be created
 
-    let _normalizer = TextNormalizer::new();
-    let _mel = MelSpectrogram::new(1024, 256, 1024, 80, 22050, 0.0)?;
+    let _normalizer = TextNormalizer::new(false);
+    let _mel = MelSpectrogram::new(1024, 256, 1024, 80, 22050, 0.0, None);
     let _speaker = CAMPPlus::new(device)?;
-    let _semantic = SemanticEncoder::new(device)?;
+    // SemanticEncoder requires a stats file path
+    let dummy_stat_path = std::path::PathBuf::from("checkpoints/w2v_stat.npy");
+    let _semantic = SemanticEncoder::load(&dummy_stat_path, None::<&std::path::PathBuf>, device)?;
     let _gpt = UnifiedVoice::new(device)?;
     let _regulator = LengthRegulator::new(device)?;
     let _dit = DiffusionTransformer::new(device)?;

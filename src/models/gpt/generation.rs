@@ -102,7 +102,7 @@ impl Sampler {
         let probs = candle_nn::ops::softmax(logits, D::Minus1)?;
 
         // Sort probabilities in descending order
-        let (sorted_probs, sorted_indices) = probs.sort_last_dim(false)?;
+        let (sorted_probs, _sorted_indices) = probs.sort_last_dim(false)?;
 
         // Compute cumulative sum
         let cumsum = cumulative_sum(&sorted_probs)?;
@@ -113,7 +113,7 @@ impl Sampler {
         let mask = cumsum.le(&threshold)?;
 
         // Ensure at least the top token is kept
-        let first_mask = Tensor::ones((1,), DType::U8, logits.device())?;
+        let _first_mask = Tensor::ones((1,), DType::U8, logits.device())?;
         // This is simplified - full implementation would handle batching properly
 
         // Mask out tokens that exceed cumulative probability

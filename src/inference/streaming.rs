@@ -6,12 +6,11 @@
 //! - Real-time playback via audio output
 
 use anyhow::Result;
-use candle_core::{Device, Tensor, DType};
-use std::path::Path;
+use candle_core::Device;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
-use crate::text::{TextNormalizer, segment_text};
+use crate::text::TextNormalizer;
 use crate::audio::StreamingPlayer;
 
 /// Streaming configuration
@@ -94,7 +93,7 @@ impl StreamingSynthesizer {
         Ok(Self {
             device: device.clone(),
             config,
-            normalizer: TextNormalizer::new(),
+            normalizer: TextNormalizer::new(false),
             text_sender: None,
             audio_receiver: None,
             is_running: false,
@@ -109,12 +108,12 @@ impl StreamingSynthesizer {
     pub fn start(&mut self, text: &str) -> Result<Receiver<AudioChunk>> {
         let (chunk_sender, chunk_receiver) = channel::<AudioChunk>();
 
-        // Segment text
+        // Normalize and split text into segments based on sentence boundaries
         let normalized = self.normalizer.normalize(text);
-        let segments = segment_text(&normalized, self.config.max_tokens_per_chunk);
+        let segments = split_into_segments(&normalized, self.config.max_tokens_per_chunk);
 
-        let device = self.device.clone();
-        let config = self.config.clone();
+        let _device = self.device.clone();
+        let _config = self.config.clone();
 
         // Spawn synthesis thread
         thread::spawn(move || {
@@ -131,7 +130,7 @@ impl StreamingSynthesizer {
                     samples,
                     i,
                     is_final,
-                    segment.to_string(),
+                    segment.clone(),
                 );
 
                 if chunk_sender.send(chunk).is_err() {
@@ -168,7 +167,7 @@ impl StreamingSynthesizer {
     /// Convenience method that handles playback automatically.
     pub fn stream_and_play(&mut self, text: &str) -> Result<()> {
         let receiver = self.start(text)?;
-        let mut player = StreamingPlayer::new(self.config.sample_rate)?;
+        let player = StreamingPlayer::new(self.config.sample_rate)?;
 
         // Prebuffer
         let mut prebuffer = Vec::new();
@@ -268,6 +267,46 @@ pub fn stream_with_callback<C: StreamingCallback + 'static>(
     });
 
     Ok(())
+}
+
+/// Split text into segments based on sentence boundaries and max length
+fn split_into_segments(text: &str, max_chars: usize) -> Vec<String> {
+    let sentence_endings = ['.', '!', '?', '。', '！', '？'];
+    let mut segments = Vec::new();
+    let mut current = String::new();
+
+    for c in text.chars() {
+        current.push(c);
+
+        // Check if we should split here
+        let should_split = if current.len() >= max_chars {
+            true
+        } else if sentence_endings.contains(&c) && current.len() > 10 {
+            true
+        } else {
+            false
+        };
+
+        if should_split {
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() {
+                segments.push(trimmed);
+            }
+            current = String::new();
+        }
+    }
+
+    // Add remaining text
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        segments.push(trimmed);
+    }
+
+    if segments.is_empty() {
+        segments.push(text.to_string());
+    }
+
+    segments
 }
 
 #[cfg(test)]

@@ -9,8 +9,8 @@
 //! - Each emotion class maps to an embedding vector
 //! - Emotion blending controlled by emo_alpha parameter
 
-use anyhow::{Context, Result};
-use candle_core::{safetensors, Device, Tensor, DType, D, IndexOp};
+use anyhow::Result;
+use candle_core::{safetensors, Device, Tensor, IndexOp};
 use std::path::Path;
 
 /// Default number of emotion categories

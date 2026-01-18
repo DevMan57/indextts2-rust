@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Sample, SampleFormat, StreamConfig};
+use cpal::SampleFormat;
 
 /// Audio output handler for saving and playback
 pub struct AudioOutput;
@@ -284,8 +284,9 @@ impl StreamingPlayer {
         let mut write = self.write_pos.lock().unwrap();
 
         for &sample in samples {
-            buffer[*write % buffer.len()] = sample;
-            *write = (*write + 1) % buffer.len();
+            let buf_len = buffer.len();
+            buffer[*write % buf_len] = sample;
+            *write = (*write + 1) % buf_len;
         }
     }
 
@@ -305,6 +306,32 @@ impl StreamingPlayer {
     /// Get the sample rate
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Write samples to the buffer (alias for push_samples with Result)
+    pub fn write(&self, samples: &[f32]) -> Result<()> {
+        self.push_samples(samples);
+        Ok(())
+    }
+
+    /// Wait for playback to complete (drain the buffer)
+    pub fn drain(&self) -> Result<()> {
+        // Wait until read catches up to write
+        loop {
+            let read = *self.read_pos.lock().unwrap();
+            let write = *self.write_pos.lock().unwrap();
+            
+            if read == write {
+                break;
+            }
+            
+            // Small delay to avoid busy-waiting
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        
+        // Extra delay for audio hardware buffer
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        Ok(())
     }
 }
 

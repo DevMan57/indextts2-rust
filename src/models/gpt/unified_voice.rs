@@ -14,9 +14,9 @@
 //! - number_mel_codes: 8194
 //! - stop_mel_token: 8193
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_core::{Device, Tensor, DType, D, IndexOp};
-use candle_nn::{Linear, Module, VarBuilder, LayerNorm, Embedding};
+use candle_nn::{Linear, Module, VarBuilder, LayerNorm};
 use std::path::Path;
 
 use super::conformer::{ConformerEncoder, ConformerConfig};
@@ -166,13 +166,16 @@ impl DecoderLayer {
 }
 
 /// Create causal attention mask
+/// Returns u8 tensor: 1 = can attend, 0 = cannot attend
 fn create_causal_mask(query_len: usize, key_len: usize, device: &Device) -> Result<Tensor> {
-    let start_pos = key_len - query_len;
-    let mut mask_data = vec![false; query_len * key_len];
+    let start_pos = key_len.saturating_sub(query_len);
+    let mut mask_data = vec![0u8; query_len * key_len];
 
     for q in 0..query_len {
         for k in 0..key_len {
-            mask_data[q * key_len + k] = k <= (start_pos + q);
+            if k <= (start_pos + q) {
+                mask_data[q * key_len + k] = 1;
+            }
         }
     }
 
@@ -381,7 +384,7 @@ impl UnifiedVoice {
             .text_embedding
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Text embedding not initialized"))?;
-        emb.index_select(text_ids, 0)
+        Ok(emb.index_select(text_ids, 0)?)
     }
 
     /// Get mel code embeddings
@@ -390,7 +393,7 @@ impl UnifiedVoice {
             .mel_embedding
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Mel embedding not initialized"))?;
-        emb.index_select(mel_ids, 0)
+        Ok(emb.index_select(mel_ids, 0)?)
     }
 
     /// Get positional embeddings
@@ -399,7 +402,7 @@ impl UnifiedVoice {
             .pos_embedding
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Position embedding not initialized"))?;
-        emb.i(offset..offset + seq_len)
+        Ok(emb.i(offset..offset + seq_len)?)
     }
 
     /// Process audio conditioning through conformer + perceiver
@@ -556,7 +559,9 @@ impl UnifiedVoice {
         // Process through decoder layers with KV cache
         let cache = self.kv_cache.as_mut().unwrap();
         for (i, layer) in self.decoder_layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, &mut cache.layer_caches[i], true)?;
+            let layer_cache = cache.get_layer_cache_mut(i)
+                .ok_or_else(|| anyhow::anyhow!("Layer cache {} not found", i))?;
+            hidden = layer.forward(&hidden, layer_cache, true)?;
         }
 
         // Final layer norm

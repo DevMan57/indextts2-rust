@@ -9,9 +9,9 @@
 //! - Duration predictor (optional)
 //! - Length expansion via upsampling
 
-use anyhow::{Context, Result};
-use candle_core::{Device, Tensor, DType, D, IndexOp};
-use candle_nn::{Linear, Module, VarBuilder, LayerNorm, Embedding};
+use anyhow::Result;
+use candle_core::{Device, Tensor, DType, IndexOp};
+use candle_nn::{Linear, Module, LayerNorm};
 use std::path::Path;
 
 /// Conv1d block for duration prediction
@@ -231,7 +231,7 @@ impl LengthRegulator {
             let flat = codes.flatten_all()?;
             let embedded = emb.index_select(&flat, 0)?;
             let (batch, seq) = codes.dims2()?;
-            embedded.reshape((batch, seq, self.config.channels))
+            Ok(embedded.reshape((batch, seq, self.config.channels))?)
         } else {
             anyhow::bail!("Content embedding not initialized for discrete input")
         }
@@ -275,7 +275,7 @@ impl LengthRegulator {
         for (b, frames) in expanded_batch.iter().enumerate() {
             for (t, &(_, s)) in frames.iter().enumerate() {
                 // Copy features[b, s, :] to output[b, t, :]
-                let src_offset = b * seq_len * channels + s * channels;
+                let _src_offset = b * seq_len * channels + s * channels;
                 let dst_offset = b * max_len * channels + t * channels;
 
                 // We need to get the data from the tensor

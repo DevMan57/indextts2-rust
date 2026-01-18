@@ -9,9 +9,9 @@
 //! - Multi-resolution fusion
 //! - Output waveform: (batch, 1, samples)
 
-use anyhow::{Context, Result};
-use candle_core::{Device, Tensor, DType, D, IndexOp};
-use candle_nn::{Linear, Module, VarBuilder, LayerNorm};
+use anyhow::Result;
+use candle_core::{Device, Tensor, DType};
+use candle_nn::Module;
 use std::path::Path;
 
 /// BigVGAN configuration
@@ -158,8 +158,8 @@ impl ConvTranspose1d {
         // Candle doesn't have native conv_transpose1d, so we use a workaround
         // by upsampling and then convolving
         let (batch, channels, time) = x.dims3()?;
-        let out_channels = self.weight.dim(1)?;
-        let kernel_size = self.weight.dim(2)?;
+        let _out_channels = self.weight.dim(1)?;
+        let _kernel_size = self.weight.dim(2)?;
 
         // Simple upsampling via repeat
         let upsampled_len = time * self.stride;
@@ -330,7 +330,7 @@ impl BigVGAN {
         self.resblocks.clear();
 
         let mut ch = h;
-        for (i, (rate, kernel)) in self.config.upsample_rates.iter()
+        for (_i, (rate, kernel)) in self.config.upsample_rates.iter()
             .zip(self.config.upsample_kernel_sizes.iter())
             .enumerate()
         {

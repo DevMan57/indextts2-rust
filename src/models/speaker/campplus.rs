@@ -10,9 +10,9 @@
 //! - Statistics pooling (mean + std)
 //! - Output: 192-dimensional speaker embedding
 
-use anyhow::{Context, Result};
-use candle_core::{safetensors, Device, Tensor, DType, D, IndexOp};
-use candle_nn::{Linear, Module, VarBuilder, LayerNorm, BatchNorm};
+use anyhow::Result;
+use candle_core::{Device, Tensor, DType, D};
+use candle_nn::{Linear, Module, VarBuilder};
 use std::path::Path;
 
 /// Default embedding dimension for CAMPPlus
@@ -307,7 +307,7 @@ impl CAMPPlus {
             return self.initialize_random();
         }
 
-        let vb = unsafe {
+        let _vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[path], DType::F32, &self.device)?
         };
 
@@ -327,7 +327,7 @@ impl CAMPPlus {
     /// # Returns
     /// * Speaker embedding (batch, 192)
     pub fn encode(&self, fbank: &Tensor) -> Result<Tensor> {
-        let (batch_size, time_len, feat_dim) = fbank.dims3()?;
+        let (batch_size, _time_len, _feat_dim) = fbank.dims3()?;
 
         // If weights not loaded, return placeholder
         if !self.weights_loaded {
@@ -349,7 +349,7 @@ impl CAMPPlus {
         let mut features = vec![x.clone()];
         let mut x = x;
 
-        for (i, block) in self.dense_blocks.iter().enumerate() {
+        for (_i, block) in self.dense_blocks.iter().enumerate() {
             // Concatenate all previous features for dense connection
             let concat = if features.len() > 1 {
                 Tensor::cat(&features.iter().collect::<Vec<_>>(), 1)?

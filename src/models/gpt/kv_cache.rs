@@ -169,6 +169,16 @@ impl KVCache {
     pub fn is_empty(&self) -> bool {
         self.layer_caches.first().map(|c| c.is_empty()).unwrap_or(true)
     }
+
+    /// Get mutable access to a specific layer cache
+    pub fn get_layer_cache_mut(&mut self, layer_idx: usize) -> Option<&mut LayerCache> {
+        self.layer_caches.get_mut(layer_idx)
+    }
+
+    /// Get immutable access to a specific layer cache
+    pub fn get_layer_cache(&self, layer_idx: usize) -> Option<&LayerCache> {
+        self.layer_caches.get(layer_idx)
+    }
 }
 
 /// Attention with KV-cache support
@@ -273,7 +283,7 @@ impl CachedAttention {
             let mask = self.create_causal_mask(seq_len, kv_seq_len, x.device())?;
             let neg_inf = Tensor::new(f32::NEG_INFINITY, x.device())?
                 .broadcast_as(attn_weights.shape())?;
-            let zeros = Tensor::zeros_like(&attn_weights)?;
+            let _zeros = Tensor::zeros_like(&attn_weights)?;
             // mask is (1, 1, seq_len, kv_seq_len), broadcast to attention weights
             let mask = mask.broadcast_as(attn_weights.shape())?;
             mask.where_cond(&attn_weights, &neg_inf)?
@@ -301,13 +311,16 @@ impl CachedAttention {
     ) -> Result<Tensor> {
         // For autoregressive generation, position i can only attend to positions <= i
         // Shape: (1, 1, query_len, key_len)
-        let start_pos = key_len - query_len;
-        let mut mask_data = vec![false; query_len * key_len];
+        // Use u8: 1 = can attend, 0 = cannot attend
+        let start_pos = key_len.saturating_sub(query_len);
+        let mut mask_data = vec![0u8; query_len * key_len];
 
         for q in 0..query_len {
             for k in 0..key_len {
                 // Can attend if key position <= query position (in absolute terms)
-                mask_data[q * key_len + k] = k <= (start_pos + q);
+                if k <= (start_pos + q) {
+                    mask_data[q * key_len + k] = 1;
+                }
             }
         }
 

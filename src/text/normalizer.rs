@@ -242,8 +242,8 @@ impl TextNormalizer {
             // Normalize quotes
             .replace('"', "\"")
             .replace('"', "\"")
-            .replace(''', "'")
-            .replace(''', "'")
+            .replace("'", "'")
+            .replace("'", "'")
             // Normalize dashes
             .replace("—", ", ")
             .replace("–", ", ")

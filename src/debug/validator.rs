@@ -3,10 +3,10 @@
 //! Compares Rust outputs to Python golden data with configurable tolerances.
 
 use anyhow::{Context, Result};
-use candle_core::{Device, Tensor, DType};
+use candle_core::Tensor;
 use std::path::Path;
 
-use super::npy_loader::{load_npy, load_npy_f32, load_npy_i64};
+use super::npy_loader::{load_npy_f32, load_npy_i64};
 
 /// Validation configuration
 #[derive(Clone)]

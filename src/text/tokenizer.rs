@@ -4,7 +4,7 @@
 //! Supports loading from JSON tokenizer files and provides comprehensive
 //! encode/decode functionality.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 use tokenizers::Tokenizer;
 

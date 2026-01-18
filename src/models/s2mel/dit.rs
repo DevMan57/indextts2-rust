@@ -6,9 +6,9 @@
 //! - UViT-style skip connections between layers
 //! - AdaLN (Adaptive Layer Normalization) for conditioning
 
-use anyhow::{Context, Result};
-use candle_core::{Device, Tensor, DType, D, IndexOp};
-use candle_nn::{Linear, Module, VarBuilder, LayerNorm};
+use anyhow::Result;
+use candle_core::{Device, Tensor, DType, D};
+use candle_nn::{Linear, Module, LayerNorm};
 use std::path::Path;
 
 /// DiT configuration
@@ -143,13 +143,13 @@ impl AdaLayerNorm {
 
         // Get scale and shift from conditioning
         let params = self.linear.forward(cond)?;
-        let (scale, shift) = params.chunk(2, D::Minus1)?;
-        let scale = scale.get(0)?;
-        let shift = shift.get(0)?;
+        let chunks = params.chunk(2, D::Minus1)?;
+        let scale = chunks.get(0).ok_or_else(|| anyhow::anyhow!("Missing scale chunk"))?;
+        let shift = chunks.get(1).ok_or_else(|| anyhow::anyhow!("Missing shift chunk"))?;
 
         // Apply: scale * normalized + shift
         let scale = (scale + 1.0)?; // Center scale around 1
-        normalized.broadcast_mul(&scale)?.broadcast_add(&shift).map_err(Into::into)
+        normalized.broadcast_mul(&scale)?.broadcast_add(shift).map_err(Into::into)
     }
 }
 
@@ -409,7 +409,7 @@ impl DiffusionTransformer {
             return Ok(x.clone());
         }
 
-        let (batch_size, seq_len, _) = x.dims3()?;
+        let (batch_size, _seq_len, _) = x.dims3()?;
 
         // Project input mel to hidden dim
         let h = if let Some(ref proj) = self.input_proj {
@@ -451,7 +451,7 @@ impl DiffusionTransformer {
 
         // First half of transformer blocks (encoder)
         let mut h = h;
-        for (i, block) in self.blocks.iter().take(mid_point).enumerate() {
+        for (_i, block) in self.blocks.iter().take(mid_point).enumerate() {
             h = block.forward(&h, &cond)?;
             if self.config.uvit_skip_connection {
                 skip_features.push(h.clone());

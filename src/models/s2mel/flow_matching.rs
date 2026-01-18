@@ -5,9 +5,8 @@
 //! - Classifier-free guidance (CFG)
 //! - Optimal transport interpolation path
 
-use anyhow::{Context, Result};
-use candle_core::{Device, Tensor, DType, D};
-use std::path::Path;
+use anyhow::Result;
+use candle_core::{Device, Tensor};
 
 use super::dit::DiffusionTransformer;
 

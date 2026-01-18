@@ -9,9 +9,9 @@
 //! - VQ: Find nearest codebook entry for each frame
 //! - Output: Quantized embeddings + discrete codes
 
-use anyhow::{Context, Result};
-use candle_core::{safetensors, Device, Tensor, DType, D, IndexOp};
-use candle_nn::{Linear, Module, VarBuilder, Embedding};
+use anyhow::Result;
+use candle_core::{Device, Tensor, DType, D};
+use candle_nn::{Linear, Module, VarBuilder};
 use std::path::Path;
 
 /// Default codebook size (8192 entries)
@@ -130,7 +130,7 @@ impl SemanticCodec {
     /// * quantized: (batch, seq_len, hidden_size)
     /// * codes: (batch, seq_len) with values in [0, codebook_size)
     pub fn quantize(&self, embeddings: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (batch_size, seq_len, hidden) = embeddings.dims3()?;
+        let (_batch_size, _seq_len, hidden) = embeddings.dims3()?;
 
         // Project to codebook dimension if projection layer exists
         let projected = if let Some(ref proj) = self.proj_in {

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::fs::File;
 
-use symphonia::core::audio::{AudioBufferRef, Signal, SampleBuffer};
+use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;

@@ -9,8 +9,8 @@
 //! - Self-attention: latents attend to each other
 //! - Multiple layers of cross + self attention
 
-use anyhow::{Context, Result};
-use candle_core::{Device, Tensor, DType, D, IndexOp};
+use anyhow::Result;
+use candle_core::{Device, Tensor, DType, D};
 use candle_nn::{Linear, Module, VarBuilder, LayerNorm};
 use std::path::Path;
 

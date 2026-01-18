@@ -7,12 +7,12 @@
 //! 4. Mel spectrogram synthesis via flow matching
 //! 5. Waveform generation via BigVGAN vocoder
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_core::{Device, Tensor, DType};
 use std::path::Path;
 
 use crate::config::ModelConfig;
-use crate::text::{TextNormalizer, TextTokenizer, segment_text};
+use crate::text::{TextNormalizer, TextTokenizer};
 use crate::audio::{AudioLoader, Resampler, MelSpectrogram, AudioOutput};
 use crate::models::semantic::{SemanticEncoder, SemanticCodec};
 use crate::models::speaker::CAMPPlus;
@@ -72,7 +72,7 @@ pub struct InferenceResult {
 impl InferenceResult {
     /// Save audio to file
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        AudioOutput::save_wav(path, &self.audio, self.sample_rate)
+        AudioOutput::save(&self.audio, self.sample_rate, path)
     }
 
     /// Get duration in seconds
@@ -133,15 +133,23 @@ impl IndexTTS2 {
         };
 
         // Initialize text processing
-        let normalizer = TextNormalizer::new();
+        let normalizer = TextNormalizer::new(false);
         let tokenizer_path = model_dir.join(&config.dataset.bpe_model);
         let tokenizer = if tokenizer_path.exists() {
-            TextTokenizer::from_file(&tokenizer_path)?
+            TextTokenizer::load(&tokenizer_path, normalizer.clone())?
         } else {
-            TextTokenizer::new()?
+            // Create a fallback tokenizer with empty/default path
+            TextTokenizer::load("tokenizer.json", normalizer.clone())
+                .unwrap_or_else(|_| {
+                    // If we can't load any tokenizer, we need to handle gracefully
+                    panic!("No tokenizer found at {:?} or default location", tokenizer_path)
+                })
         };
 
         // Initialize audio processing
+        let fmax_f32 = config.s2mel.preprocess_params.spect_params.fmax
+            .as_ref()
+            .and_then(|s| s.parse::<f32>().ok());
         let mel_extractor = MelSpectrogram::new(
             config.s2mel.preprocess_params.spect_params.n_fft,
             config.s2mel.preprocess_params.spect_params.hop_length,
@@ -149,10 +157,12 @@ impl IndexTTS2 {
             config.s2mel.preprocess_params.spect_params.n_mels,
             config.s2mel.preprocess_params.sr,
             config.s2mel.preprocess_params.spect_params.fmin,
-        )?;
+            fmax_f32,
+        );
 
-        // Initialize encoders
-        let semantic_encoder = SemanticEncoder::new(&device)?;
+        // Initialize encoders - use placeholder paths for now
+        let w2v_stat_path = model_dir.join(&config.w2v_stat);
+        let semantic_encoder = SemanticEncoder::load(&w2v_stat_path, None::<&std::path::PathBuf>, &device)?;
         let semantic_codec = SemanticCodec::new(&device)?;
         let speaker_encoder = CAMPPlus::new(&device)?;
         let emotion_matrix = Some(EmotionMatrix::new(&device)?);
@@ -190,13 +200,12 @@ impl IndexTTS2 {
     pub fn load_weights<P: AsRef<Path>>(&mut self, model_dir: P) -> Result<()> {
         let model_dir = model_dir.as_ref();
 
-        // Load semantic encoder
+        // Load semantic encoder weights if available
         let w2v_path = model_dir.join(&self.config.w2v_stat);
         if w2v_path.exists() {
             self.semantic_encoder.load_weights(&w2v_path)?;
-        } else {
-            self.semantic_encoder.initialize_random()?;
         }
+        // SemanticEncoder is initialized with placeholder weights by default
 
         // Load GPT
         let gpt_path = model_dir.join(&self.config.gpt_checkpoint);
@@ -268,32 +277,44 @@ impl IndexTTS2 {
             .unsqueeze(0)?; // Add batch dimension
 
         // 2. Load and process speaker reference
-        let speaker_samples = AudioLoader::load_file(speaker_audio.as_ref())?;
-        let speaker_samples = Resampler::resample_to_16k(&speaker_samples, 22050)?;
+        let (speaker_samples, _sr) = AudioLoader::load(speaker_audio.as_ref(), 16000)?;
+        let speaker_samples = Resampler::resample_to_16k(&speaker_samples, 16000)?;
 
-        // Extract speaker embedding
+        // Create mel features for speaker encoder (expects mel filterbank features)
+        let speaker_mel_2d = self.mel_extractor.compute(&speaker_samples)?;
+        // Flatten 2D mel [n_frames, n_mels] to 1D for Tensor::from_slice
+        let speaker_mel: Vec<f32> = speaker_mel_2d.into_iter().flatten().collect();
+        let n_frames = speaker_mel.len() / 80;
         let speaker_tensor = Tensor::from_slice(
+            &speaker_mel,
+            (1, n_frames, 80), // (batch, time, mel_bands)
+            &self.device,
+        )?;
+        let speaker_emb = self.speaker_encoder.encode(&speaker_tensor)?;
+
+        // Extract semantic features for conditioning (encode expects audio tensor)
+        let audio_tensor = Tensor::from_slice(
             &speaker_samples,
             (1, speaker_samples.len()),
             &self.device,
         )?;
-        let speaker_emb = self.speaker_encoder.forward(&speaker_tensor)?;
-
-        // Extract semantic features for conditioning
-        let semantic_features = self.semantic_encoder.forward(&speaker_tensor)?;
-        let semantic_codes = self.semantic_codec.quantize(&semantic_features)?;
+        let semantic_features = self.semantic_encoder.encode(&audio_tensor, None)?;
+        let (semantic_codes, _) = self.semantic_codec.quantize(&semantic_features)?;
 
         // 3. Optional emotion processing
-        let emotion_emb = if let Some(emo_path) = emotion_audio {
-            if let Some(ref emo_matrix) = self.emotion_matrix {
-                let emo_samples = AudioLoader::load_file(emo_path.as_ref())?;
+        let _emotion_emb = if let Some(emo_path) = emotion_audio {
+            if let Some(ref _emo_matrix) = self.emotion_matrix {
+                let (emo_samples, _) = AudioLoader::load(emo_path.as_ref(), 16000)?;
+                let emo_mel_2d = self.mel_extractor.compute(&emo_samples)?;
+                let emo_mel: Vec<f32> = emo_mel_2d.into_iter().flatten().collect();
+                let emo_frames = emo_mel.len() / 80;
                 let emo_tensor = Tensor::from_slice(
-                    &emo_samples,
-                    (1, emo_samples.len()),
+                    &emo_mel,
+                    (1, emo_frames, 80),
                     &self.device,
                 )?;
                 // For now, use speaker embedding as emotion basis
-                Some(self.speaker_encoder.forward(&emo_tensor)?)
+                Some(self.speaker_encoder.encode(&emo_tensor)?)
             } else {
                 None
             }
@@ -312,7 +333,7 @@ impl IndexTTS2 {
         };
 
         // Process conditioning through conformer/perceiver
-        let conditioning = self.gpt.process_conditioning(&semantic_codes, &speaker_emb)?;
+        let conditioning = self.gpt.process_conditioning(&semantic_codes)?;
 
         let mel_codes = generate(
             &mut self.gpt,
