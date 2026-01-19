@@ -12,12 +12,15 @@ Cargo.lock
 # OS
 .DS_Store
 Thumbs.db
+nul
 
 # Model weights (too large for git)
 /checkpoints/*.pth
+/checkpoints/*.pt
 /checkpoints/*.safetensors
 /checkpoints/*.bin
 /checkpoints/*.onnx
+/checkpoints/tokenizer.json
 !/checkpoints/.gitkeep
 
 # Audio files
@@ -30,5 +33,15 @@ Thumbs.db
 /logs/
 *.log
 
-# Ralph
+# Claude Code local files (don't push to GitHub)
+.claude/*.local.md
+.claude/*.local.json
+.claude/settings.local.json
+.claude/ralph-loop.local.md
+
+# Ralph loop state
 status.json
+
+# Debug/temporary
+/debug/golden/
+*.npy
