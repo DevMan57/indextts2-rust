@@ -50,15 +50,16 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| WEIGHT-01 | TBD | Pending |
-| WEIGHT-02 | TBD | Pending |
-| WEIGHT-03 | TBD | Pending |
-| WEIGHT-04 | TBD | Pending |
-| GPU-01 | TBD | Pending |
-| GPU-02 | TBD | Pending |
-| GPU-03 | TBD | Pending |
-| VERIFY-01 | TBD | Pending |
-| VERIFY-02 | TBD | Pending |
+| WEIGHT-01 | Phase 2: Wav2Vec-BERT Weights | Pending |
+| WEIGHT-02 | Phase 4: DiT Weights | Pending |
+| WEIGHT-03 | Phase 3: GPT Components | Pending |
+| WEIGHT-04 | Phase 3: GPT Components | Pending |
+| GPU-01 | Phase 5: CUDA Foundation | Pending |
+| GPU-02 | Phase 6: CUDA Optimization | Pending |
+| GPU-03 | Phase 7: Weight Validation | Pending |
+| VERIFY-01 | Phase 8: Integration Testing | Pending |
+| VERIFY-02 | Phase 8: Integration Testing | Pending |
 
 ---
 *Requirements defined: 2026-01-23*
+*Traceability updated: 2026-01-23*
