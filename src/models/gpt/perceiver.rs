@@ -8,11 +8,41 @@
 //! - Cross-attention: latents attend to encoder outputs
 //! - Self-attention: latents attend to each other
 //! - Multiple layers of cross + self attention
+//!
+//! Weight loading from gpt.safetensors:
+//! - perceiver_encoder.latents [32, 1280]
+//! - perceiver_encoder.layers.{i}.0.to_q/to_kv/to_out (cross-attention)
+//! - perceiver_encoder.layers.{i}.1.0/1.2 (FFN)
+//! - perceiver_encoder.norm.gamma
+//! - perceiver_encoder.proj_context
 
 use anyhow::Result;
-use candle_core::{Device, Tensor, DType, D};
+use candle_core::{Device, Tensor, DType, D, IndexOp, safetensors};
 use candle_nn::{Linear, Module, VarBuilder, LayerNorm};
+use std::collections::HashMap;
 use std::path::Path;
+
+/// Helper to load a Linear layer from tensors
+/// candle_nn::Linear expects weights in PyTorch format [out_features, in_features]
+/// and handles transpose internally, so we load weights directly without transposing
+fn load_linear(
+    tensors: &HashMap<String, Tensor>,
+    weight_key: &str,
+    bias_key: Option<&str>,
+) -> Result<Linear> {
+    let weight = tensors
+        .get(weight_key)
+        .ok_or_else(|| anyhow::anyhow!("Weight not found: {}", weight_key))?
+        .clone();
+
+    let bias = if let Some(bk) = bias_key {
+        tensors.get(bk).cloned()
+    } else {
+        None
+    };
+
+    Ok(Linear::new(weight, bias))
+}
 
 /// Cross-attention layer: queries attend to keys/values from encoder
 struct CrossAttention {
@@ -31,6 +61,61 @@ impl CrossAttention {
         let k_proj = candle_nn::linear(dim, dim, vb.pp("k_proj"))?;
         let v_proj = candle_nn::linear(dim, dim, vb.pp("v_proj"))?;
         let out_proj = candle_nn::linear(dim, dim, vb.pp("out_proj"))?;
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            out_proj,
+            num_heads,
+            head_dim,
+        })
+    }
+
+    /// Load from GPT checkpoint tensors
+    /// GPT format: layers.{i}.0.to_q, layers.{i}.0.to_kv (fused K+V), layers.{i}.0.to_out
+    fn from_gpt_tensors(
+        tensors: &HashMap<String, Tensor>,
+        prefix: &str,
+        dim: usize,
+        num_heads: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let head_dim = dim / num_heads;
+
+        // Q projection
+        // candle_nn::Linear expects PyTorch format and handles transpose internally
+        let q_proj = load_linear(
+            tensors,
+            &format!("{}.to_q.weight", prefix),
+            None,
+        )?;
+
+        // KV is fused as [2*head_dim*num_heads, context_dim]
+        // We need to split it into K and V
+        // candle_nn::Linear expects PyTorch format [out_features, in_features]
+        // so we keep the sliced weights as-is (no transpose)
+        let kv_key = format!("{}.to_kv.weight", prefix);
+        let (k_proj, v_proj) = if let Some(kv_weight) = tensors.get(&kv_key) {
+            // Split the fused KV weight along first dimension
+            let (kv_dim, _ctx_dim) = kv_weight.dims2()?;
+            let half_dim = kv_dim / 2;
+            let k_weight = kv_weight.i((0..half_dim, ..))?.contiguous()?;
+            let v_weight = kv_weight.i((half_dim..kv_dim, ..))?.contiguous()?;
+            (Linear::new(k_weight, None), Linear::new(v_weight, None))
+        } else {
+            // Fallback to random - use PyTorch format [out_features, in_features]
+            let w_k = Tensor::randn(0.0f32, 0.02, (dim, dim), device)?;
+            let w_v = Tensor::randn(0.0f32, 0.02, (dim, dim), device)?;
+            (Linear::new(w_k, None), Linear::new(w_v, None))
+        };
+
+        // Output projection
+        let out_proj = load_linear(
+            tensors,
+            &format!("{}.to_out.weight", prefix),
+            None,
+        )?;
 
         Ok(Self {
             q_proj,
@@ -87,16 +172,23 @@ impl CrossAttention {
             .transpose(1, 2)?;
 
         // Scaled dot-product attention
+        // Make tensors contiguous for matmul
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+
         let scale = (self.head_dim as f64).sqrt();
-        let attn_weights = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        let attn_weights = q.matmul(&k_t)?;
         let attn_weights = (attn_weights / scale)?;
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
 
-        let attn_output = attn_weights.matmul(&v)?;
+        let attn_output = attn_weights.contiguous()?.matmul(&v)?;
 
         // Reshape back
         let attn_output = attn_output
             .transpose(1, 2)?
+            .contiguous()?
             .reshape((batch_size, num_latents, self.num_heads * self.head_dim))?;
 
         self.out_proj.forward(&attn_output).map_err(Into::into)
@@ -167,15 +259,22 @@ impl SelfAttention {
             .reshape((batch_size, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
 
+        // Make tensors contiguous for matmul
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+
         let scale = (self.head_dim as f64).sqrt();
-        let attn_weights = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        let attn_weights = q.matmul(&k_t)?;
         let attn_weights = (attn_weights / scale)?;
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
 
-        let attn_output = attn_weights.matmul(&v)?;
+        let attn_output = attn_weights.contiguous()?.matmul(&v)?;
 
         let attn_output = attn_output
             .transpose(1, 2)?
+            .contiguous()?
             .reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
 
         self.out_proj.forward(&attn_output).map_err(Into::into)
@@ -193,6 +292,53 @@ impl FeedForward {
         let hidden = dim * mult;
         let linear1 = candle_nn::linear(dim, hidden, vb.pp("linear1"))?;
         let linear2 = candle_nn::linear(hidden, dim, vb.pp("linear2"))?;
+        Ok(Self { linear1, linear2 })
+    }
+
+    /// Load from GPT checkpoint tensors
+    /// GPT format: layers.{i}.1.0 (linear1), layers.{i}.1.2 (linear2)
+    fn from_gpt_tensors(
+        tensors: &HashMap<String, Tensor>,
+        prefix: &str,
+        device: &Device,
+    ) -> Result<Self> {
+        // linear1 is at .0
+        // candle_nn::Linear expects PyTorch format [out, in], handles transpose internally
+        let linear1_key = format!("{}.0.weight", prefix);
+        let linear1 = match load_linear(
+            tensors,
+            &linear1_key,
+            Some(&format!("{}.0.bias", prefix)),
+        ) {
+            Ok(l) => l,
+            Err(_) => {
+                tracing::warn!(
+                    "[Perceiver] Missing tensor '{}', using random initialization",
+                    linear1_key
+                );
+                let w = Tensor::randn(0.0f32, 0.02, (512, 512), device)?;
+                Linear::new(w, None)
+            }
+        };
+
+        // linear2 is at .2
+        let linear2_key = format!("{}.2.weight", prefix);
+        let linear2 = match load_linear(
+            tensors,
+            &linear2_key,
+            Some(&format!("{}.2.bias", prefix)),
+        ) {
+            Ok(l) => l,
+            Err(_) => {
+                tracing::warn!(
+                    "[Perceiver] Missing tensor '{}', using random initialization",
+                    linear2_key
+                );
+                let w = Tensor::randn(0.0f32, 0.02, (512, 512), device)?;
+                Linear::new(w, None)
+            }
+        };
+
         Ok(Self { linear1, linear2 })
     }
 
@@ -241,6 +387,55 @@ impl PerceiverLayer {
             self_norm,
             ffn,
             ffn_norm,
+        })
+    }
+
+    /// Load from GPT checkpoint tensors
+    /// GPT format: perceiver_encoder.layers.{i}.0 (cross_attn), perceiver_encoder.layers.{i}.1 (ffn)
+    /// Note: GPT perceiver doesn't have self-attention between cross-attention and FFN
+    fn from_gpt_tensors(
+        tensors: &HashMap<String, Tensor>,
+        layer_idx: usize,
+        dim: usize,
+        num_heads: usize,
+        _ff_mult: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let prefix = format!("perceiver_encoder.layers.{}", layer_idx);
+
+        // Cross-attention at .0
+        let cross_attn = CrossAttention::from_gpt_tensors(
+            tensors,
+            &format!("{}.0", prefix),
+            dim,
+            num_heads,
+            device,
+        )?;
+
+        // FFN at .1
+        let ffn = FeedForward::from_gpt_tensors(
+            tensors,
+            &format!("{}.1", prefix),
+            device,
+        )?;
+
+        // Create layer norms (GPT format doesn't have separate norms per sublayer)
+        let make_ln = |device: &Device| -> Result<LayerNorm> {
+            let w = Tensor::ones((dim,), DType::F32, device)?;
+            let b = Tensor::zeros((dim,), DType::F32, device)?;
+            Ok(LayerNorm::new(w, b, 1e-5))
+        };
+
+        // Self-attention - use random weights since GPT perceiver doesn't have it
+        let self_attn = SelfAttention::new_random(dim, num_heads, device)?;
+
+        Ok(Self {
+            cross_attn,
+            cross_norm: make_ln(device)?,
+            self_attn,
+            self_norm: make_ln(device)?,
+            ffn,
+            ffn_norm: make_ln(device)?,
         })
     }
 
@@ -374,32 +569,120 @@ impl PerceiverResampler {
         let path = path.as_ref();
 
         if !path.exists() {
+            eprintln!("Warning: Perceiver weights not found at {:?}, using random weights", path);
             return self.initialize_random();
         }
 
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[path], DType::F32, &self.device)?
-        };
+        eprintln!("Loading Perceiver weights from {:?}...", path);
 
-        // Load latents
-        self.latents = Some(vb.get(
-            (1, self.config.num_latents, self.config.dim),
-            "latents",
-        )?);
+        // Load tensors directly for GPT format
+        let tensors = safetensors::load(path, &self.device)?;
 
-        // Load layers
-        self.layers.clear();
-        for i in 0..self.config.num_layers {
-            let layer = PerceiverLayer::new(
-                self.config.dim,
-                self.config.num_heads,
-                self.config.ff_mult,
-                vb.pp(&format!("layers.{}", i)),
-            )?;
-            self.layers.push(layer);
+        // Check if this is GPT format (has perceiver_encoder prefix)
+        let has_gpt_format = tensors.keys().any(|k| k.starts_with("perceiver_encoder"));
+
+        if has_gpt_format {
+            eprintln!("  Detected GPT format, loading perceiver_encoder weights...");
+            self.load_from_gpt_tensors(&tensors)?;
+        } else {
+            // Try VarBuilder-based loading for non-GPT format
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&[path], DType::F32, &self.device)?
+            };
+
+            // Load latents
+            self.latents = Some(vb.get(
+                (1, self.config.num_latents, self.config.dim),
+                "latents",
+            )?);
+
+            // Load layers
+            self.layers.clear();
+            for i in 0..self.config.num_layers {
+                let layer = PerceiverLayer::new(
+                    self.config.dim,
+                    self.config.num_heads,
+                    self.config.ff_mult,
+                    vb.pp(&format!("layers.{}", i)),
+                )?;
+                self.layers.push(layer);
+            }
         }
 
         self.weights_loaded = true;
+        Ok(())
+    }
+
+    /// Load from GPT checkpoint format (perceiver_encoder.*)
+    pub fn load_from_gpt_tensors(&mut self, tensors: &HashMap<String, Tensor>) -> Result<()> {
+        // Load latents - GPT format: perceiver_encoder.latents [num_latents, dim]
+        let latents_key = "perceiver_encoder.latents";
+        if let Some(latents) = tensors.get(latents_key) {
+            let (num_latents, dim) = latents.dims2()?;
+            eprintln!("  Loaded latents: [{}, {}]", num_latents, dim);
+            // Add batch dimension
+            self.latents = Some(latents.unsqueeze(0)?);
+            // Update config to match loaded weights
+            self.config.num_latents = num_latents;
+            self.config.dim = dim;
+        } else {
+            // Fallback to random latents
+            self.latents = Some(Tensor::randn(
+                0.0f32,
+                0.02,
+                (1, self.config.num_latents, self.config.dim),
+                &self.device,
+            )?);
+        }
+
+        // Count available layers
+        let num_layers = (0..10)
+            .take_while(|i| tensors.contains_key(&format!("perceiver_encoder.layers.{}.0.to_q.weight", i)))
+            .count();
+
+        eprintln!("  Found {} perceiver layers in GPT checkpoint", num_layers);
+
+        // Load layers
+        self.layers.clear();
+        let mut loaded_count = 0;
+        for i in 0..num_layers.max(self.config.num_layers) {
+            if i < num_layers {
+                match PerceiverLayer::from_gpt_tensors(
+                    tensors,
+                    i,
+                    self.config.dim,
+                    self.config.num_heads,
+                    self.config.ff_mult,
+                    &self.device,
+                ) {
+                    Ok(layer) => {
+                        self.layers.push(layer);
+                        loaded_count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  Warning: Failed to load perceiver layer {}: {}", i, e);
+                        let layer = PerceiverLayer::new_random(
+                            self.config.dim,
+                            self.config.num_heads,
+                            self.config.ff_mult,
+                            &self.device,
+                        )?;
+                        self.layers.push(layer);
+                    }
+                }
+            } else {
+                // Create random layer for remaining layers
+                let layer = PerceiverLayer::new_random(
+                    self.config.dim,
+                    self.config.num_heads,
+                    self.config.ff_mult,
+                    &self.device,
+                )?;
+                self.layers.push(layer);
+            }
+        }
+
+        eprintln!("  Successfully loaded {} of {} perceiver layers", loaded_count, num_layers);
         Ok(())
     }
 

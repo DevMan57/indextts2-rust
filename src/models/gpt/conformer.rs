@@ -9,11 +9,71 @@
 //! - Convolution module
 //! - Feed-forward module (half-step residual)
 //! - Layer normalization
+//!
+//! Weight loading from gpt.safetensors:
+//! - conditioning_encoder.encoders.{i}.self_attn.linear_q/k/v/out
+//! - conditioning_encoder.encoders.{i}.feed_forward.w_1/w_2
+//! - conditioning_encoder.encoders.{i}.conv_module.*
+//! - conditioning_encoder.encoders.{i}.norm_mha/norm_ff/norm_conv/norm_final
 
 use anyhow::Result;
-use candle_core::{Device, Tensor, DType, D};
+use candle_core::{Device, Tensor, DType, D, safetensors};
 use candle_nn::{Linear, Module, VarBuilder, LayerNorm};
+use std::collections::HashMap;
 use std::path::Path;
+
+/// Helper to load a Linear layer from tensors
+/// candle_nn::Linear expects weights in PyTorch format [out_features, in_features]
+/// and handles transpose internally, so we load weights directly without transposing
+fn load_linear(
+    tensors: &HashMap<String, Tensor>,
+    weight_key: &str,
+    bias_key: Option<&str>,
+) -> Result<Linear> {
+    let weight = tensors
+        .get(weight_key)
+        .ok_or_else(|| anyhow::anyhow!("Weight not found: {}", weight_key))?
+        .clone();
+
+    let bias = if let Some(bk) = bias_key {
+        tensors.get(bk).cloned()
+    } else {
+        None
+    };
+
+    Ok(Linear::new(weight, bias))
+}
+
+/// Helper to load LayerNorm from tensors
+fn load_layer_norm_from_tensors(
+    tensors: &HashMap<String, Tensor>,
+    weight_key: &str,
+    bias_key: &str,
+    dim: usize,
+    device: &Device,
+) -> Result<LayerNorm> {
+    let weight = match tensors.get(weight_key) {
+        Some(w) => w.clone(),
+        None => {
+            tracing::warn!(
+                "[Conformer] Missing tensor '{}', using ones initialization",
+                weight_key
+            );
+            Tensor::ones((dim,), DType::F32, device)?
+        }
+    };
+    let bias = match tensors.get(bias_key) {
+        Some(b) => b.clone(),
+        None => {
+            tracing::warn!(
+                "[Conformer] Missing tensor '{}', using zeros initialization",
+                bias_key
+            );
+            Tensor::zeros((dim,), DType::F32, device)?
+        }
+    };
+    Ok(LayerNorm::new(weight, bias, 1e-5))
+}
 
 /// Swish activation function: x * sigmoid(x)
 fn swish(x: &Tensor) -> Result<Tensor> {
@@ -44,6 +104,43 @@ impl FeedForwardModule {
         let layer_norm = candle_nn::layer_norm(dim, 1e-5, vb.pp("layer_norm"))?;
         let linear1 = candle_nn::linear(dim, hidden_dim, vb.pp("linear1"))?;
         let linear2 = candle_nn::linear(hidden_dim, dim, vb.pp("linear2"))?;
+
+        Ok(Self {
+            layer_norm,
+            linear1,
+            linear2,
+            dropout_rate: 0.1,
+        })
+    }
+
+    /// Load from GPT checkpoint tensors
+    /// GPT format: feed_forward.w_1, feed_forward.w_2 (no expansion factor specified)
+    fn from_gpt_tensors(
+        tensors: &HashMap<String, Tensor>,
+        prefix: &str,
+        norm_prefix: &str,
+        dim: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let layer_norm = load_layer_norm_from_tensors(
+            tensors,
+            &format!("{}.weight", norm_prefix),
+            &format!("{}.bias", norm_prefix),
+            dim,
+            device,
+        )?;
+
+        let linear1 = load_linear(
+            tensors,
+            &format!("{}.w_1.weight", prefix),
+            Some(&format!("{}.w_1.bias", prefix)),
+        )?;
+
+        let linear2 = load_linear(
+            tensors,
+            &format!("{}.w_2.weight", prefix),
+            Some(&format!("{}.w_2.bias", prefix)),
+        )?;
 
         Ok(Self {
             layer_norm,
@@ -116,6 +213,61 @@ impl MultiHeadAttention {
         })
     }
 
+    /// Load from GPT checkpoint tensors
+    /// GPT format: self_attn.linear_q, self_attn.linear_k, etc.
+    fn from_gpt_tensors(
+        tensors: &HashMap<String, Tensor>,
+        prefix: &str,
+        norm_prefix: &str,
+        dim: usize,
+        num_heads: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let head_dim = dim / num_heads;
+
+        let layer_norm = load_layer_norm_from_tensors(
+            tensors,
+            &format!("{}.weight", norm_prefix),
+            &format!("{}.bias", norm_prefix),
+            dim,
+            device,
+        )?;
+
+        let q_proj = load_linear(
+            tensors,
+            &format!("{}.linear_q.weight", prefix),
+            Some(&format!("{}.linear_q.bias", prefix)),
+        )?;
+
+        let k_proj = load_linear(
+            tensors,
+            &format!("{}.linear_k.weight", prefix),
+            Some(&format!("{}.linear_k.bias", prefix)),
+        )?;
+
+        let v_proj = load_linear(
+            tensors,
+            &format!("{}.linear_v.weight", prefix),
+            Some(&format!("{}.linear_v.bias", prefix)),
+        )?;
+
+        let out_proj = load_linear(
+            tensors,
+            &format!("{}.linear_out.weight", prefix),
+            Some(&format!("{}.linear_out.bias", prefix)),
+        )?;
+
+        Ok(Self {
+            layer_norm,
+            q_proj,
+            k_proj,
+            v_proj,
+            out_proj,
+            num_heads,
+            head_dim,
+        })
+    }
+
     fn new_random(dim: usize, num_heads: usize, device: &Device) -> Result<Self> {
         let head_dim = dim / num_heads;
 
@@ -162,8 +314,14 @@ impl MultiHeadAttention {
             .transpose(1, 2)?;
 
         // Scaled dot-product attention
+        // Make tensors contiguous for matmul
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+
         let scale = (self.head_dim as f64).sqrt();
-        let attn_weights = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        let attn_weights = q.matmul(&k_t)?;
         let attn_weights = (attn_weights / scale)?;
 
         // Apply mask if provided
@@ -179,7 +337,7 @@ impl MultiHeadAttention {
         };
 
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        let attn_output = attn_weights.contiguous()?.matmul(&v)?;
 
         // Reshape back: (batch, heads, seq, head_dim) -> (batch, seq, dim)
         let attn_output = attn_output
@@ -210,6 +368,87 @@ impl ConvolutionModule {
         let depthwise_conv_bias = vb.get((dim,), "depthwise_conv.bias")?;
         // Pointwise conv back to dim
         let pointwise_conv2 = candle_nn::linear(dim, dim, vb.pp("pointwise_conv2"))?;
+
+        Ok(Self {
+            layer_norm,
+            pointwise_conv1,
+            depthwise_conv_weight,
+            depthwise_conv_bias,
+            pointwise_conv2,
+            kernel_size,
+        })
+    }
+
+    /// Load from GPT checkpoint tensors
+    /// GPT format: conv_module.pointwise_conv1, conv_module.depthwise_conv, etc.
+    fn from_gpt_tensors(
+        tensors: &HashMap<String, Tensor>,
+        prefix: &str,
+        norm_prefix: &str,
+        dim: usize,
+        kernel_size: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let layer_norm = load_layer_norm_from_tensors(
+            tensors,
+            &format!("{}.weight", norm_prefix),
+            &format!("{}.bias", norm_prefix),
+            dim,
+            device,
+        )?;
+
+        // Pointwise conv1 weight is stored as [out_channels, in_channels, 1]
+        // We need to reshape it to Linear format
+        let pw1_key = format!("{}.pointwise_conv1.weight", prefix);
+        let pointwise_conv1 = if let Some(weight) = tensors.get(&pw1_key) {
+            // Weight is [out_channels, in_channels, 1] - reshape to [out, in]
+            let (out_ch, in_ch, _k) = weight.dims3()?;
+            let weight = weight.reshape((out_ch, in_ch))?;
+            let bias = tensors.get(&format!("{}.pointwise_conv1.bias", prefix)).cloned();
+            Linear::new(weight, bias)
+        } else {
+            // Fallback to random
+            let w = Tensor::randn(0.0f32, 0.02, (dim * 2, dim), device)?;
+            let b = Tensor::zeros((dim * 2,), DType::F32, device)?;
+            Linear::new(w, Some(b))
+        };
+
+        // Depthwise conv
+        let dw_key = format!("{}.depthwise_conv.weight", prefix);
+        let depthwise_conv_weight = match tensors.get(&dw_key) {
+            Some(w) => w.clone(),
+            None => {
+                tracing::warn!(
+                    "[Conformer] Missing tensor '{}', using random initialization",
+                    dw_key
+                );
+                Tensor::randn(0.0f32, 0.02, (dim, 1, kernel_size), device)?
+            }
+        };
+        let dw_bias_key = format!("{}.depthwise_conv.bias", prefix);
+        let depthwise_conv_bias = match tensors.get(&dw_bias_key) {
+            Some(b) => b.clone(),
+            None => {
+                tracing::warn!(
+                    "[Conformer] Missing tensor '{}', using zeros initialization",
+                    dw_bias_key
+                );
+                Tensor::zeros((dim,), DType::F32, device)?
+            }
+        };
+
+        // Pointwise conv2
+        let pw2_key = format!("{}.pointwise_conv2.weight", prefix);
+        let pointwise_conv2 = if let Some(weight) = tensors.get(&pw2_key) {
+            let (out_ch, in_ch, _k) = weight.dims3()?;
+            let weight = weight.reshape((out_ch, in_ch))?;
+            let bias = tensors.get(&format!("{}.pointwise_conv2.bias", prefix)).cloned();
+            Linear::new(weight, bias)
+        } else {
+            let w = Tensor::randn(0.0f32, 0.02, (dim, dim), device)?;
+            let b = Tensor::zeros((dim,), DType::F32, device)?;
+            Linear::new(w, Some(b))
+        };
 
         Ok(Self {
             layer_norm,
@@ -301,6 +540,69 @@ impl ConformerBlock {
         let conv = ConvolutionModule::new(dim, conv_kernel_size, vb.pp("conv"))?;
         let ff2 = FeedForwardModule::new(dim, ff_expansion, vb.pp("ff2"))?;
         let final_layer_norm = candle_nn::layer_norm(dim, 1e-5, vb.pp("final_layer_norm"))?;
+
+        Ok(Self {
+            ff1,
+            attention,
+            conv,
+            ff2,
+            final_layer_norm,
+        })
+    }
+
+    /// Load from GPT checkpoint tensors
+    /// GPT format for layer i: conditioning_encoder.encoders.{i}.*
+    fn from_gpt_tensors(
+        tensors: &HashMap<String, Tensor>,
+        layer_idx: usize,
+        dim: usize,
+        num_heads: usize,
+        conv_kernel_size: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let prefix = format!("conditioning_encoder.encoders.{}", layer_idx);
+
+        // Feed-forward module (GPT has one ff, we use it for ff1)
+        // Note: GPT conditioning_encoder uses norm_ff for the FF module
+        let ff1 = FeedForwardModule::from_gpt_tensors(
+            tensors,
+            &format!("{}.feed_forward", prefix),
+            &format!("{}.norm_ff", prefix),
+            dim,
+            device,
+        )?;
+
+        // Multi-head attention
+        let attention = MultiHeadAttention::from_gpt_tensors(
+            tensors,
+            &format!("{}.self_attn", prefix),
+            &format!("{}.norm_mha", prefix),
+            dim,
+            num_heads,
+            device,
+        )?;
+
+        // Convolution module
+        let conv = ConvolutionModule::from_gpt_tensors(
+            tensors,
+            &format!("{}.conv_module", prefix),
+            &format!("{}.norm_conv", prefix),
+            dim,
+            conv_kernel_size,
+            device,
+        )?;
+
+        // Create ff2 with random weights (GPT only has one FF per layer)
+        let ff2 = FeedForwardModule::new_random(dim, 4, device)?;
+
+        // Final layer norm
+        let final_layer_norm = load_layer_norm_from_tensors(
+            tensors,
+            &format!("{}.norm_final.weight", prefix),
+            &format!("{}.norm_final.bias", prefix),
+            dim,
+            device,
+        )?;
 
         Ok(Self {
             ff1,
@@ -450,34 +752,107 @@ impl ConformerEncoder {
         let path = path.as_ref();
 
         if !path.exists() {
+            eprintln!("Warning: Conformer weights not found at {:?}, using random weights", path);
             return self.initialize_random();
         }
 
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[path], DType::F32, &self.device)?
-        };
+        eprintln!("Loading Conformer weights from {:?}...", path);
 
-        // Load input projection
-        self.input_proj = Some(candle_nn::linear(
-            self.config.input_dim,
-            self.config.output_dim,
-            vb.pp("input_proj"),
-        )?);
+        // Load tensors directly for GPT format
+        let tensors = safetensors::load(path, &self.device)?;
 
-        // Load conformer blocks
-        self.blocks.clear();
-        for i in 0..self.config.num_blocks {
-            let block = ConformerBlock::new(
+        // Check if this is GPT format (has conditioning_encoder prefix)
+        let has_gpt_format = tensors.keys().any(|k| k.starts_with("conditioning_encoder"));
+
+        if has_gpt_format {
+            eprintln!("  Detected GPT format, loading conditioning_encoder weights...");
+            self.load_from_gpt_tensors(&tensors)?;
+        } else {
+            // Try VarBuilder-based loading for non-GPT format
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&[path], DType::F32, &self.device)?
+            };
+
+            // Load input projection
+            self.input_proj = Some(candle_nn::linear(
+                self.config.input_dim,
                 self.config.output_dim,
-                self.config.num_heads,
-                self.config.ff_expansion,
-                self.config.conv_kernel_size,
-                vb.pp(&format!("blocks.{}", i)),
-            )?;
-            self.blocks.push(block);
+                vb.pp("input_proj"),
+            )?);
+
+            // Load conformer blocks
+            self.blocks.clear();
+            for i in 0..self.config.num_blocks {
+                let block = ConformerBlock::new(
+                    self.config.output_dim,
+                    self.config.num_heads,
+                    self.config.ff_expansion,
+                    self.config.conv_kernel_size,
+                    vb.pp(&format!("blocks.{}", i)),
+                )?;
+                self.blocks.push(block);
+            }
         }
 
         self.weights_loaded = true;
+        Ok(())
+    }
+
+    /// Load from GPT checkpoint format (conditioning_encoder.*)
+    fn load_from_gpt_tensors(&mut self, tensors: &HashMap<String, Tensor>) -> Result<()> {
+        // Input projection - GPT uses a conv-based embed layer instead of linear
+        // We'll use random weights for input_proj since the architecture differs
+        let w = Tensor::randn(
+            0.0f32,
+            0.02,
+            (self.config.output_dim, self.config.input_dim),
+            &self.device,
+        )?;
+        let b = Tensor::zeros((self.config.output_dim,), DType::F32, &self.device)?;
+        self.input_proj = Some(Linear::new(w, Some(b)));
+
+        // Count available encoder layers in the checkpoint
+        let num_layers = (0..20)
+            .take_while(|i| tensors.contains_key(&format!("conditioning_encoder.encoders.{}.self_attn.linear_q.weight", i)))
+            .count();
+
+        eprintln!("  Found {} encoder layers in GPT checkpoint", num_layers);
+
+        // Update config to match checkpoint
+        let actual_blocks = num_layers.min(self.config.num_blocks);
+
+        // Load conformer blocks
+        self.blocks.clear();
+        let mut loaded_count = 0;
+        for i in 0..actual_blocks {
+            match ConformerBlock::from_gpt_tensors(
+                tensors,
+                i,
+                self.config.output_dim,
+                self.config.num_heads,
+                self.config.conv_kernel_size,
+                &self.device,
+            ) {
+                Ok(block) => {
+                    self.blocks.push(block);
+                    loaded_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("  Warning: Failed to load conformer block {}: {}", i, e);
+                    // Fall back to random weights for this block
+                    let block = ConformerBlock::new_random(
+                        self.config.output_dim,
+                        self.config.num_heads,
+                        self.config.ff_expansion,
+                        self.config.conv_kernel_size,
+                        &self.device,
+                    )?;
+                    self.blocks.push(block);
+                }
+            }
+        }
+
+        eprintln!("  Successfully loaded {} of {} conformer blocks", loaded_count, actual_blocks);
         Ok(())
     }
 
