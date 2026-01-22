@@ -7,8 +7,8 @@
 //! 4. Mel spectrogram synthesis via flow matching
 //! 5. Waveform generation via BigVGAN vocoder
 
-use anyhow::Result;
-use candle_core::{Device, Tensor, DType};
+use anyhow::{Result, Context};
+use candle_core::{Device, Tensor, DType, D};
 use std::path::Path;
 
 use crate::config::ModelConfig;
@@ -17,7 +17,7 @@ use crate::audio::{AudioLoader, Resampler, MelSpectrogram, AudioOutput};
 use crate::models::semantic::{SemanticEncoder, SemanticCodec};
 use crate::models::speaker::CAMPPlus;
 use crate::models::emotion::EmotionMatrix;
-use crate::models::gpt::{UnifiedVoice, GenerationConfig, generate};
+use crate::models::gpt::{UnifiedVoice, GenerationConfig, generate, generate_with_hidden};
 use crate::models::s2mel::{LengthRegulator, DiffusionTransformer, FlowMatching};
 use crate::models::vocoder::BigVGAN;
 
@@ -40,6 +40,8 @@ pub struct InferenceConfig {
     pub cfg_rate: f32,
     /// Whether to use GPU
     pub use_gpu: bool,
+    /// Enable verbose weight loading diagnostics
+    pub verbose_weights: bool,
 }
 
 impl Default for InferenceConfig {
@@ -53,6 +55,7 @@ impl Default for InferenceConfig {
             flow_steps: 25,
             cfg_rate: 0.7,
             use_gpu: false,
+            verbose_weights: false,
         }
     }
 }
@@ -93,6 +96,7 @@ pub struct IndexTTS2 {
 
     // Audio processing
     mel_extractor: MelSpectrogram,
+    #[allow(dead_code)]
     resampler: Option<Resampler>,
 
     // Encoders
@@ -200,39 +204,68 @@ impl IndexTTS2 {
     pub fn load_weights<P: AsRef<Path>>(&mut self, model_dir: P) -> Result<()> {
         let model_dir = model_dir.as_ref();
 
-        // Load semantic encoder weights if available
-        let w2v_path = model_dir.join(&self.config.w2v_stat);
-        if w2v_path.exists() {
-            self.semantic_encoder.load_weights(&w2v_path)?;
+        // Load Wav2Vec-BERT full model if available
+        if let Some(ref w2v_model) = self.config.w2v_model {
+            let w2v_path = model_dir.join(w2v_model);
+            if w2v_path.exists() {
+                tracing::info!("Loading Wav2Vec-BERT model from {:?}...", w2v_path);
+                self.semantic_encoder.load_weights(&w2v_path)
+                    .with_context(|| format!("Failed to load Wav2Vec-BERT from {:?}", w2v_path))?;
+            }
         }
-        // SemanticEncoder is initialized with placeholder weights by default
 
         // Load GPT
         let gpt_path = model_dir.join(&self.config.gpt_checkpoint);
         if gpt_path.exists() {
-            self.gpt.load_weights(&gpt_path)?;
+            self.gpt.load_weights(&gpt_path)
+                .with_context(|| format!("Failed to load GPT weights from {:?}", gpt_path))?;
         } else {
-            self.gpt.initialize_random()?;
+            self.gpt.initialize_random()
+                .context("Failed to initialize GPT with random weights")?;
         }
 
         // Load S2Mel (DiT)
         let s2mel_path = model_dir.join(&self.config.s2mel_checkpoint);
         if s2mel_path.exists() {
-            self.dit.load_weights(&s2mel_path)?;
-            self.length_regulator.load_weights(&s2mel_path)?;
+            self.dit.load_weights(&s2mel_path)
+                .with_context(|| format!("Failed to load DiT weights from {:?}", s2mel_path))?;
+            self.length_regulator.load_weights(&s2mel_path)
+                .with_context(|| format!("Failed to load LengthRegulator weights from {:?}", s2mel_path))?;
         } else {
-            self.dit.initialize_random()?;
-            self.length_regulator.initialize_random()?;
+            self.dit.initialize_random()
+                .context("Failed to initialize DiT with random weights")?;
+            self.length_regulator.initialize_random()
+                .context("Failed to initialize LengthRegulator with random weights")?;
         }
 
-        // Load vocoder
-        self.vocoder.initialize_random()?;
+        // Load BigVGAN vocoder
+        if let Some(ref bigvgan_path) = self.config.bigvgan_checkpoint {
+            let vocoder_path = model_dir.join(bigvgan_path);
+            if vocoder_path.exists() {
+                tracing::info!("Loading BigVGAN from {:?}...", vocoder_path);
+                self.vocoder.load_weights(&vocoder_path)
+                    .with_context(|| format!("Failed to load BigVGAN weights from {:?}", vocoder_path))?;
+            } else {
+                self.vocoder.initialize_random()
+                    .context("Failed to initialize BigVGAN with random weights")?;
+            }
+        } else {
+            self.vocoder.initialize_random()
+                .context("Failed to initialize BigVGAN with random weights")?;
+        }
+
+        // Initialize speaker encoder with random weights
+        // Note: No CAMPPlus checkpoint available, using random initialization
+        tracing::info!("Initializing speaker encoder (CAMPPlus)...");
+        self.speaker_encoder.initialize_random()
+            .context("Failed to initialize CAMPPlus speaker encoder")?;
 
         // Load emotion matrix
         if let Some(ref mut emo) = self.emotion_matrix {
             let emo_path = model_dir.join(&self.config.emo_matrix);
             if emo_path.exists() {
-                emo.load_weights(&emo_path)?;
+                emo.load_weights(&emo_path)
+                    .with_context(|| format!("Failed to load emotion matrix from {:?}", emo_path))?;
             }
         }
 
@@ -272,16 +305,22 @@ impl IndexTTS2 {
     ) -> Result<InferenceResult> {
         // 1. Normalize and tokenize text
         let normalized = self.normalizer.normalize(text);
-        let tokens = self.tokenizer.encode(&normalized)?;
-        let text_ids = Tensor::new(&tokens[..], &self.device)?
+        let tokens = self.tokenizer.encode(&normalized)
+            .context("Failed to tokenize input text")?;
+        let text_ids = Tensor::new(&tokens[..], &self.device)
+            .context("Failed to create text token tensor")?
             .unsqueeze(0)?; // Add batch dimension
 
         // 2. Load and process speaker reference
-        let (speaker_samples, _sr) = AudioLoader::load(speaker_audio.as_ref(), 16000)?;
-        let speaker_samples = Resampler::resample_to_16k(&speaker_samples, 16000)?;
+        let speaker_path = speaker_audio.as_ref();
+        let (speaker_samples, _sr) = AudioLoader::load(speaker_path, 16000)
+            .with_context(|| format!("Failed to load speaker audio from {:?}", speaker_path))?;
+        let speaker_samples = Resampler::resample_to_16k(&speaker_samples, 16000)
+            .context("Failed to resample speaker audio to 16kHz")?;
 
         // Create mel features for speaker encoder (expects mel filterbank features)
-        let speaker_mel_2d = self.mel_extractor.compute(&speaker_samples)?;
+        let speaker_mel_2d = self.mel_extractor.compute(&speaker_samples)
+            .context("Failed to compute mel spectrogram for speaker audio")?;
         // Flatten 2D mel [n_frames, n_mels] to 1D for Tensor::from_slice
         let speaker_mel: Vec<f32> = speaker_mel_2d.into_iter().flatten().collect();
         let n_frames = speaker_mel.len() / 80;
@@ -289,17 +328,20 @@ impl IndexTTS2 {
             &speaker_mel,
             (1, n_frames, 80), // (batch, time, mel_bands)
             &self.device,
-        )?;
-        let speaker_emb = self.speaker_encoder.encode(&speaker_tensor)?;
+        ).context("Failed to create speaker mel tensor")?;
+        let speaker_emb = self.speaker_encoder.encode(&speaker_tensor)
+            .context("Failed to encode speaker embedding")?;
 
         // Extract semantic features for conditioning (encode expects audio tensor)
         let audio_tensor = Tensor::from_slice(
             &speaker_samples,
             (1, speaker_samples.len()),
             &self.device,
-        )?;
-        let semantic_features = self.semantic_encoder.encode(&audio_tensor, None)?;
-        let (semantic_codes, _) = self.semantic_codec.quantize(&semantic_features)?;
+        ).context("Failed to create audio tensor for semantic encoding")?;
+        let semantic_features = self.semantic_encoder.encode(&audio_tensor, None)
+            .context("Failed to encode semantic features")?;
+        let (_semantic_codes, _) = self.semantic_codec.quantize(&semantic_features)
+            .context("Failed to quantize semantic features")?;
 
         // 3. Optional emotion processing
         let _emotion_emb = if let Some(emo_path) = emotion_audio {
@@ -322,7 +364,7 @@ impl IndexTTS2 {
             None
         };
 
-        // 4. GPT generation - produce mel codes
+        // 4. GPT generation - produce mel codes AND hidden states
         let gen_config = GenerationConfig {
             max_length: self.inference_config.max_mel_tokens,
             temperature: self.inference_config.temperature,
@@ -333,39 +375,182 @@ impl IndexTTS2 {
         };
 
         // Process conditioning through conformer/perceiver
-        let conditioning = self.gpt.process_conditioning(&semantic_codes)?;
+        let conditioning = self.gpt.process_conditioning(&speaker_tensor)?;
 
-        let mel_codes = generate(
+        // Generate mel codes AND capture hidden states (latent)
+        // Python: codes, latent = gpt.inference_speech(...)
+        let (mel_codes, hidden_states) = generate_with_hidden(
             &mut self.gpt,
             &text_ids,
             Some(&conditioning),
             &gen_config,
         )?;
 
-        // 5. Length regulation - expand mel codes
-        let mel_codes_tensor = Tensor::new(&mel_codes[..], &self.device)?
-            .unsqueeze(0)?
-            .to_dtype(DType::F32)?;
+        // 5. Compute S_infer = vq2emb(codes) + gpt_layer(latent)
+        // This is the critical fix from the Python reference implementation
 
+        // Debug: Check mel codes distribution
+        eprintln!("DEBUG: mel_codes count={}, min={}, max={}",
+            mel_codes.len(),
+            mel_codes.iter().min().unwrap_or(&0),
+            mel_codes.iter().max().unwrap_or(&0));
+
+        // hidden_states: (1, num_codes, 1280) - GPT hidden states before lm_head
+        let hs_mean: f32 = hidden_states.mean_all()?.to_scalar()?;
+        let hs_var: f32 = hidden_states.var(D::Minus1)?.mean_all()?.to_scalar()?;
+        eprintln!("DEBUG: hidden_states (latent) shape={:?}, mean={:.4}, var={:.4}",
+            hidden_states.shape(), hs_mean, hs_var);
+
+        // Step 1: gpt_layer(latent) - project hidden states: 1280 → 1024
+        let latent_projected = self.length_regulator.project_gpt_embeddings(&hidden_states)?;
+        let lp_mean: f32 = latent_projected.mean_all()?.to_scalar()?;
+        let lp_var: f32 = latent_projected.var(D::Minus1)?.mean_all()?.to_scalar()?;
+        eprintln!("DEBUG: gpt_layer(latent) shape={:?}, mean={:.4}, var={:.4}",
+            latent_projected.shape(), lp_mean, lp_var);
+
+        // Step 2: vq2emb(codes) - embed mel codes and project to 1024
+        // Use GPT's mel_embedding to get 1280-dim, then project to 1024
+        let mel_codes_tensor = Tensor::new(&mel_codes[..], &self.device)?
+            .unsqueeze(0)?; // Shape: [1, seq_len]
+        let mel_embeddings = self.gpt.embed_mel_codes(&mel_codes_tensor)?;
+        let me_mean: f32 = mel_embeddings.mean_all()?.to_scalar()?;
+        let me_var: f32 = mel_embeddings.var(D::Minus1)?.mean_all()?.to_scalar()?;
+        eprintln!("DEBUG: vq2emb(codes) raw shape={:?}, mean={:.4}, var={:.4}",
+            mel_embeddings.shape(), me_mean, me_var);
+
+        // Project mel embeddings to 1024 (same as latent projection)
+        let code_embeddings = self.length_regulator.project_gpt_embeddings(&mel_embeddings)?;
+        let ce_mean: f32 = code_embeddings.mean_all()?.to_scalar()?;
+        let ce_var: f32 = code_embeddings.var(D::Minus1)?.mean_all()?.to_scalar()?;
+        eprintln!("DEBUG: vq2emb(codes) projected shape={:?}, mean={:.4}, var={:.4}",
+            code_embeddings.shape(), ce_mean, ce_var);
+
+        // Step 3: S_infer = vq2emb(codes) + gpt_layer(latent)
+        // This is the key computation from Python!
+        let s_infer = (&code_embeddings + &latent_projected)?;
+        let si_mean: f32 = s_infer.mean_all()?.to_scalar()?;
+        let si_var: f32 = s_infer.var(D::Minus1)?.mean_all()?.to_scalar()?;
+        eprintln!("DEBUG: S_infer = vq2emb + latent, shape={:?}, mean={:.4}, var={:.4}",
+            s_infer.shape(), si_mean, si_var);
+
+        // Step 4: Process through length regulator (1024 → 512)
         let (content_features, _durations) = self.length_regulator.forward(
-            &mel_codes_tensor.unsqueeze(2)?, // Add feature dim
+            &s_infer,
             None,
         )?;
+
+        // Debug: Check content features
+        let cf_mean: f32 = content_features.mean_all()?.to_scalar()?;
+        let cf_var: f32 = content_features.var(D::Minus1)?.mean_all()?.to_scalar()?;
+        eprintln!("DEBUG: content_features shape={:?}, mean={:.4}, var={:.4}",
+            content_features.shape(), cf_mean, cf_var);
+
+        // Debug: Check speaker embedding
+        let spk_mean: f32 = speaker_emb.mean_all()?.to_scalar()?;
+        let spk_var: f32 = speaker_emb.var(D::Minus1)?.mean_all()?.to_scalar()?;
+        eprintln!("DEBUG: speaker_emb shape={:?}, mean={:.4}, var={:.4}",
+            speaker_emb.shape(), spk_mean, spk_var);
+
+        // Debug: Analyze speaker mel spectrogram (ground truth)
+        {
+            let spk_mel_2d = speaker_tensor.squeeze(0)?; // [n_frames, 80]
+            let spk_mel_mean: f32 = spk_mel_2d.mean_all()?.to_scalar()?;
+            let spk_mel_min: f32 = spk_mel_2d.flatten_all()?.min(0)?.to_scalar()?;
+            let spk_mel_max: f32 = spk_mel_2d.flatten_all()?.max(0)?.to_scalar()?;
+            let band_means: Vec<f32> = (0..80).map(|i| {
+                spk_mel_2d.narrow(1, i, 1).unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap()
+            }).collect();
+            let low_bands: f32 = band_means[0..20].iter().sum::<f32>() / 20.0;
+            let mid_bands: f32 = band_means[20..50].iter().sum::<f32>() / 30.0;
+            let high_bands: f32 = band_means[50..80].iter().sum::<f32>() / 30.0;
+            eprintln!("DEBUG: SPEAKER mel - mean={:.4}, range=[{:.4},{:.4}], bands: low={:.4} mid={:.4} high={:.4}",
+                spk_mel_mean, spk_mel_min, spk_mel_max, low_bands, mid_bands, high_bands);
+        }
 
         // 6. Flow matching synthesis
         let (batch_size, seq_len, _) = content_features.dims3()?;
         let noise = self.flow_matching.sample_noise(&[batch_size, seq_len, 80])?;
 
-        let mel_spec = self.flow_matching.sample(
+        // Mel normalization constants - the model was trained on normalized mels
+        // These values center the log-mel range around 0 with reasonable variance
+        // Note: Common TTS normalization uses mean=-5 to -7, std=4 to 5
+        // Trying mean=-5.5, std=2 based on speaker mel distribution
+        const MEL_MEAN: f64 = -5.5;  // Center of typical log-mel range
+        const MEL_STD: f64 = 2.0;    // Typical dynamic range (try smaller for more aggressive normalization)
+
+        // Create prompt_x from reference mel by padding/truncating to match seq_len
+        let speaker_mel_len = speaker_tensor.dim(1)?;
+        let prompt_x_raw = if speaker_mel_len >= seq_len {
+            // Truncate: take first seq_len frames from speaker mel
+            speaker_tensor.narrow(1, 0, seq_len)?
+        } else {
+            // Pad: repeat speaker mel to fill seq_len
+            let repeat_factor = (seq_len + speaker_mel_len - 1) / speaker_mel_len;
+            let repeated = speaker_tensor.repeat(&[1, repeat_factor, 1])?;
+            repeated.narrow(1, 0, seq_len)?
+        };
+
+        // Normalize prompt_x: (mel - mean) / std
+        let prompt_x = ((&prompt_x_raw - MEL_MEAN)? / MEL_STD)?;
+        let prompt_norm_mean: f32 = prompt_x.mean_all()?.to_scalar()?;
+        eprintln!("DEBUG: Normalized prompt_x mean: {:.4} (raw mean: {:.4})",
+            prompt_norm_mean, speaker_tensor.mean_all()?.to_scalar::<f32>()?);
+
+        // For pure TTS (not inpainting), use prompt_len=0 to generate entire sequence
+        // The reference mel in prompt_x provides conditioning context but we generate all frames
+        // Note: If doing audio continuation/inpainting, set prompt_len = speaker_mel_len.min(seq_len)
+        let prompt_len = 0; // Pure TTS mode
+        eprintln!("DEBUG: Flow matching with seq_len={}, speaker_mel_len={}, prompt_len={}",
+            seq_len, speaker_mel_len, prompt_len);
+        let mel_spec_normalized = self.flow_matching.sample(
             &self.dit,
             &noise,
+            &prompt_x,
             &content_features,
-            Some(&speaker_emb),
+            &speaker_emb,
+            prompt_len,
         )?;
 
-        // 7. Vocoder - mel to audio
+        // Denormalize output: mel = norm_mel * std + mean
+        let mel_spec = ((&mel_spec_normalized * MEL_STD)? + MEL_MEAN)?;
+
+        // Debug: Check mel spectrogram output
+        let mel_mean: f32 = mel_spec.mean_all()?.to_scalar()?;
+        let mel_var: f32 = mel_spec.var(D::Minus1)?.mean_all()?.to_scalar()?;
+        let mel_min: f32 = mel_spec.flatten_all()?.min(0)?.to_scalar()?;
+        let mel_max: f32 = mel_spec.flatten_all()?.max(0)?.to_scalar()?;
+        eprintln!("DEBUG: mel_spec shape={:?}, mean={:.4}, var={:.4}, min={:.4}, max={:.4}",
+            mel_spec.shape(), mel_mean, mel_var, mel_min, mel_max);
+
+        // Detailed mel band analysis
+        {
+            let mel_2d = mel_spec.squeeze(0)?; // [seq_len, 80]
+            let band_means: Vec<f32> = (0..80).map(|i| {
+                mel_2d.narrow(1, i, 1).unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap()
+            }).collect();
+            let low_bands: f32 = band_means[0..20].iter().sum::<f32>() / 20.0;
+            let mid_bands: f32 = band_means[20..50].iter().sum::<f32>() / 30.0;
+            let high_bands: f32 = band_means[50..80].iter().sum::<f32>() / 30.0;
+            eprintln!("DEBUG: mel band analysis - low(0-20)={:.4}, mid(20-50)={:.4}, high(50-80)={:.4}",
+                low_bands, mid_bands, high_bands);
+        }
+
+        // 7. Compare generated mel with speaker mel (for debugging)
+        let generated_mean: f32 = mel_spec.mean_all()?.to_scalar()?;
+        let speaker_mel_mean: f32 = speaker_tensor.mean_all()?.to_scalar()?;
+        eprintln!("DEBUG: Generated mel mean: {:.4}, Speaker mel mean: {:.4}, diff: {:.4}",
+            generated_mean, speaker_mel_mean, speaker_mel_mean - generated_mean);
+
+        // 8. Vocoder - mel to audio
         let mel_transposed = mel_spec.transpose(1, 2)?; // (batch, mel, time)
         let audio_tensor = self.vocoder.forward(&mel_transposed)?;
+
+        // Debug: Check audio output
+        let audio_mean: f32 = audio_tensor.mean_all()?.to_scalar()?;
+        let audio_min: f32 = audio_tensor.flatten_all()?.min(0)?.to_scalar()?;
+        let audio_max: f32 = audio_tensor.flatten_all()?.max(0)?.to_scalar()?;
+        eprintln!("DEBUG: audio shape={:?}, mean={:.6}, min={:.4}, max={:.4}",
+            audio_tensor.shape(), audio_mean, audio_min, audio_max);
 
         let audio: Vec<f32> = audio_tensor.squeeze(0)?.squeeze(0)?.to_vec1()?;
 
@@ -411,11 +596,15 @@ impl IndexTTS2 {
         // Flow matching
         let (batch_size, seq_len, _) = content_features.dims3()?;
         let noise = self.flow_matching.sample_noise(&[batch_size, seq_len, 80])?;
+        let prompt_x = Tensor::zeros((batch_size, seq_len, 80), DType::F32, &self.device)?;
+        // Zero prompt region - prompt_len=0 when no reference mel
         let mel_spec = self.flow_matching.sample(
             &self.dit,
             &noise,
+            &prompt_x,
             &content_features,
-            Some(speaker_emb),
+            speaker_emb,
+            0, // No prompt region to zero
         )?;
 
         // Vocoder

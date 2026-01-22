@@ -173,6 +173,7 @@ fn main() -> Result<()> {
                 top_k,
                 top_p,
                 use_gpu: !cli.cpu,
+                verbose_weights: cli.verbose,
                 ..Default::default()
             };
 
