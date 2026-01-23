@@ -12,7 +12,7 @@ This roadmap fixes weight loading for four neural network components (Wav2Vec-BE
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Diagnostic Infrastructure** - Add strict validation to expose weight loading failures
+- [x] **Phase 1: Diagnostic Infrastructure** - Add strict validation to expose weight loading failures
 - [ ] **Phase 2: Wav2Vec-BERT Weights** - Fix semantic encoder weight loading
 - [ ] **Phase 3: GPT Components** - Fix Conformer and Perceiver weight loading
 - [ ] **Phase 4: DiT Weights** - Fix flow matching model weight loading
@@ -35,7 +35,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 Plans:
 - [x] 01-01-PLAN.md — Create WeightDiagnostics module and add tracing::warn! to silent fallbacks
-- [ ] 01-02-PLAN.md — Wire WeightDiagnostics into model loading pipeline (gap closure)
+- [x] 01-02-PLAN.md — Wire WeightDiagnostics into model loading pipeline (gap closure)
 
 ### Phase 2: Wav2Vec-BERT Weights
 **Goal**: Semantic encoder loads pre-trained weights and produces meaningful embeddings
@@ -143,7 +143,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Diagnostic Infrastructure | 1/2 | Gap closure needed | - |
+| 1. Diagnostic Infrastructure | 2/2 | Verified ✓ | 2026-01-23 |
 | 2. Wav2Vec-BERT Weights | 0/1 | Not started | - |
 | 3. GPT Components | 0/2 | Not started | - |
 | 4. DiT Weights | 0/1 | Not started | - |
