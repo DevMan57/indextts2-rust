@@ -15,7 +15,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 1: Diagnostic Infrastructure** - Add strict validation to expose weight loading failures
 - [x] **Phase 2: Wav2Vec-BERT Weights** - Fix semantic encoder weight loading
 - [x] **Phase 3: GPT Components** - Fix Conformer and Perceiver weight loading
-- [ ] **Phase 4: DiT Weights** - Fix flow matching model weight loading
+- [x] **Phase 4: DiT Weights** - Fix flow matching model weight loading
 - [ ] **Phase 5: CUDA Foundation** - Enable GPU device selection and basic CUDA inference
 - [ ] **Phase 6: CUDA Optimization** - Enable cuDNN acceleration for convolutions
 - [ ] **Phase 7: Weight Validation** - Verify all components load correctly without fallback
@@ -78,7 +78,7 @@ Plans:
 **Plans:** 1 plan
 
 Plans:
-- [ ] 04-01-PLAN.md — Add skip_in_linear to DiTBlock and verify all weights load
+- [x] 04-01-PLAN.md — Add skip_in_linear to DiTBlock and verify all weights load
 
 ### Phase 5: CUDA Foundation
 **Goal**: User can run inference on CUDA device instead of CPU
@@ -147,7 +147,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8
 | 1. Diagnostic Infrastructure | 2/2 | Verified | 2026-01-23 |
 | 2. Wav2Vec-BERT Weights | 2/2 | Verified | 2026-01-23 |
 | 3. GPT Components | 2/2 | Verified | 2026-01-23 |
-| 4. DiT Weights | 0/1 | Planned | - |
+| 4. DiT Weights | 1/1 | Verified | 2026-01-24 |
 | 5. CUDA Foundation | 0/1 | Not started | - |
 | 6. CUDA Optimization | 0/1 | Not started | - |
 | 7. Weight Validation | 0/1 | Not started | - |
