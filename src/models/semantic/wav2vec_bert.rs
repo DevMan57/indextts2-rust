@@ -29,6 +29,10 @@ const NUM_LAYERS: usize = 24;
 const INTERMEDIATE_SIZE: usize = 4096;
 /// Layer to extract features from (0-indexed)
 const EXTRACT_LAYER: usize = 17;
+/// Input feature dimension (from feature extractor)
+const INPUT_FEATURE_DIM: usize = 160;
+/// Conv module kernel size
+const CONV_KERNEL_SIZE: usize = 31;
 
 /// Helper to load a Linear layer from tensors
 /// candle_nn::Linear expects weights in PyTorch format [out_features, in_features]
@@ -81,6 +85,187 @@ fn load_layer_norm(
         }
     };
     Ok(LayerNorm::new(weight, bias, 1e-5))
+}
+
+/// Swish activation function: x * sigmoid(x)
+fn swish(x: &Tensor) -> Result<Tensor> {
+    let sigmoid = candle_nn::ops::sigmoid(x)?;
+    (x * sigmoid).map_err(Into::into)
+}
+
+/// GLU (Gated Linear Unit) activation
+/// Splits input along last dimension and applies gate
+fn glu(x: &Tensor, dim: usize) -> Result<Tensor> {
+    let chunks = x.chunk(2, dim)?;
+    let a = &chunks[0];
+    let b = &chunks[1];
+    let gate = candle_nn::ops::sigmoid(b)?;
+    (a * gate).map_err(Into::into)
+}
+
+/// ConvModule for Wav2Vec-BERT 2.0 Conformer-like architecture
+///
+/// Implements depthwise separable convolution with GLU and Swish activations.
+/// Processing flow:
+/// 1. LayerNorm (pre-GLU normalization)
+/// 2. Pointwise conv1 (expand 1024 -> 2048 for GLU)
+/// 3. GLU activation (splits 2048 -> 1024)
+/// 4. Depthwise conv (kernel=31, groups=1024)
+/// 5. Depthwise LayerNorm
+/// 6. Swish activation
+/// 7. Pointwise conv2 (1024 -> 1024)
+struct ConvModule {
+    layer_norm: LayerNorm,
+    pointwise_conv1: Linear,
+    depthwise_conv_weight: Tensor,
+    depthwise_layer_norm: LayerNorm,
+    pointwise_conv2: Linear,
+    kernel_size: usize,
+}
+
+impl ConvModule {
+    /// Load from HuggingFace checkpoint tensors
+    /// Tensor names: encoder.layers.{i}.conv_module.*
+    fn from_tensors(
+        tensors: &HashMap<String, Tensor>,
+        prefix: &str,
+        dim: usize,
+        kernel_size: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        // Layer norm
+        let layer_norm = load_layer_norm(
+            tensors,
+            &format!("{}.layer_norm.weight", prefix),
+            &format!("{}.layer_norm.bias", prefix),
+            dim,
+            device,
+        )?;
+
+        // Pointwise conv1: [2048, 1024, 1] -> reshape to [2048, 1024]
+        let pw1_key = format!("{}.pointwise_conv1.weight", prefix);
+        let pointwise_conv1 = if let Some(weight) = tensors.get(&pw1_key) {
+            let (out_ch, in_ch, _k) = weight.dims3()?;
+            let weight = weight.reshape((out_ch, in_ch))?;
+            // No bias in checkpoint
+            Linear::new(weight, None)
+        } else {
+            tracing::warn!(
+                "[Wav2Vec-BERT] Missing tensor '{}', using random initialization",
+                pw1_key
+            );
+            let w = Tensor::randn(0.0f32, 0.02, (dim * 2, dim), device)?;
+            Linear::new(w, None)
+        };
+
+        // Depthwise conv: [1024, 1, 31] - no bias
+        let dw_key = format!("{}.depthwise_conv.weight", prefix);
+        let depthwise_conv_weight = match tensors.get(&dw_key) {
+            Some(w) => w.clone(),
+            None => {
+                tracing::warn!(
+                    "[Wav2Vec-BERT] Missing tensor '{}', using random initialization",
+                    dw_key
+                );
+                Tensor::randn(0.0f32, 0.02, (dim, 1, kernel_size), device)?
+            }
+        };
+
+        // Depthwise layer norm
+        let depthwise_layer_norm = load_layer_norm(
+            tensors,
+            &format!("{}.depthwise_layer_norm.weight", prefix),
+            &format!("{}.depthwise_layer_norm.bias", prefix),
+            dim,
+            device,
+        )?;
+
+        // Pointwise conv2: [1024, 1024, 1] -> reshape to [1024, 1024]
+        let pw2_key = format!("{}.pointwise_conv2.weight", prefix);
+        let pointwise_conv2 = if let Some(weight) = tensors.get(&pw2_key) {
+            let (out_ch, in_ch, _k) = weight.dims3()?;
+            let weight = weight.reshape((out_ch, in_ch))?;
+            // No bias in checkpoint
+            Linear::new(weight, None)
+        } else {
+            tracing::warn!(
+                "[Wav2Vec-BERT] Missing tensor '{}', using random initialization",
+                pw2_key
+            );
+            let w = Tensor::randn(0.0f32, 0.02, (dim, dim), device)?;
+            Linear::new(w, None)
+        };
+
+        Ok(Self {
+            layer_norm,
+            pointwise_conv1,
+            depthwise_conv_weight,
+            depthwise_layer_norm,
+            pointwise_conv2,
+            kernel_size,
+        })
+    }
+
+    /// Initialize with random weights (fallback)
+    fn new_random(dim: usize, kernel_size: usize, device: &Device) -> Result<Self> {
+        let ln_weight = Tensor::ones((dim,), DType::F32, device)?;
+        let ln_bias = Tensor::zeros((dim,), DType::F32, device)?;
+        let layer_norm = LayerNorm::new(ln_weight.clone(), ln_bias.clone(), 1e-5);
+
+        let w1 = Tensor::randn(0.0f32, 0.02, (dim * 2, dim), device)?;
+        let pointwise_conv1 = Linear::new(w1, None);
+
+        let depthwise_conv_weight = Tensor::randn(0.0f32, 0.02, (dim, 1, kernel_size), device)?;
+
+        let depthwise_layer_norm = LayerNorm::new(ln_weight.clone(), ln_bias.clone(), 1e-5);
+
+        let w2 = Tensor::randn(0.0f32, 0.02, (dim, dim), device)?;
+        let pointwise_conv2 = Linear::new(w2, None);
+
+        Ok(Self {
+            layer_norm,
+            pointwise_conv1,
+            depthwise_conv_weight,
+            depthwise_layer_norm,
+            pointwise_conv2,
+            kernel_size,
+        })
+    }
+
+    /// Forward pass through conv module
+    /// Input: (batch, seq, dim) -> Output: (batch, seq, dim)
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // 1. Layer norm
+        let x = self.layer_norm.forward(x)?;
+
+        // 2. Pointwise conv1 (expand for GLU)
+        let x = self.pointwise_conv1.forward(&x)?;
+
+        // 3. GLU activation (along feature dim)
+        let x = glu(&x, 2)?;
+
+        // 4. Depthwise conv: transpose to (batch, channels, seq)
+        let x = x.transpose(1, 2)?;
+        let padding = self.kernel_size / 2; // 31 / 2 = 15
+        let x = x.conv1d(
+            &self.depthwise_conv_weight,
+            padding,
+            1, // stride
+            1, // dilation
+            x.dim(1)?, // groups = channels (depthwise)
+        )?;
+        // Transpose back to (batch, seq, channels)
+        let x = x.transpose(1, 2)?;
+
+        // 5. Depthwise layer norm
+        let x = self.depthwise_layer_norm.forward(&x)?;
+
+        // 6. Swish activation
+        let x = swish(&x)?;
+
+        // 7. Pointwise conv2
+        self.pointwise_conv2.forward(&x).map_err(Into::into)
+    }
 }
 
 /// Self-attention layer for Wav2Vec-BERT
