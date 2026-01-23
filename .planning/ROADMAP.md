@@ -13,7 +13,7 @@ This roadmap fixes weight loading for four neural network components (Wav2Vec-BE
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Diagnostic Infrastructure** - Add strict validation to expose weight loading failures
-- [ ] **Phase 2: Wav2Vec-BERT Weights** - Fix semantic encoder weight loading
+- [x] **Phase 2: Wav2Vec-BERT Weights** - Fix semantic encoder weight loading
 - [ ] **Phase 3: GPT Components** - Fix Conformer and Perceiver weight loading
 - [ ] **Phase 4: DiT Weights** - Fix flow matching model weight loading
 - [ ] **Phase 5: CUDA Foundation** - Enable GPU device selection and basic CUDA inference
@@ -48,8 +48,8 @@ Plans:
 **Plans:** 2 plans
 
 Plans:
-- [ ] 02-01-PLAN.md — Implement ConvModule and FeatureProjection structs
-- [ ] 02-02-PLAN.md — Fix stats var->std conversion and add distance_embedding
+- [x] 02-01-PLAN.md — Implement ConvModule and FeatureProjection structs
+- [x] 02-02-PLAN.md — Fix stats var->std conversion and add distance_embedding
 
 ### Phase 3: GPT Components
 **Goal**: Conformer encoder and Perceiver resampler load pre-trained weights from gpt.safetensors
@@ -145,7 +145,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Diagnostic Infrastructure | 2/2 | Verified | 2026-01-23 |
-| 2. Wav2Vec-BERT Weights | 0/2 | Planned | - |
+| 2. Wav2Vec-BERT Weights | 2/2 | Verified | 2026-01-23 |
 | 3. GPT Components | 0/2 | Not started | - |
 | 4. DiT Weights | 0/1 | Not started | - |
 | 5. CUDA Foundation | 0/1 | Not started | - |
