@@ -182,13 +182,19 @@ impl FeedForwardModule {
     }
 }
 
-/// Multi-head self-attention module
+/// Multi-head self-attention module with relative position encoding
 struct MultiHeadAttention {
     layer_norm: LayerNorm,
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
     out_proj: Linear,
+    /// Position encoding projection [dim, dim]
+    linear_pos: Linear,
+    /// Per-head content bias for relative position [num_heads, head_dim]
+    pos_bias_u: Tensor,
+    /// Per-head position bias for relative position [num_heads, head_dim]
+    pos_bias_v: Tensor,
     num_heads: usize,
     head_dim: usize,
 }
@@ -196,11 +202,15 @@ struct MultiHeadAttention {
 impl MultiHeadAttention {
     fn new(dim: usize, num_heads: usize, vb: VarBuilder) -> Result<Self> {
         let head_dim = dim / num_heads;
+        let device = vb.device();
         let layer_norm = candle_nn::layer_norm(dim, 1e-5, vb.pp("layer_norm"))?;
         let q_proj = candle_nn::linear(dim, dim, vb.pp("q_proj"))?;
         let k_proj = candle_nn::linear(dim, dim, vb.pp("k_proj"))?;
         let v_proj = candle_nn::linear(dim, dim, vb.pp("v_proj"))?;
         let out_proj = candle_nn::linear(dim, dim, vb.pp("out_proj"))?;
+        let linear_pos = candle_nn::linear(dim, dim, vb.pp("linear_pos"))?;
+        let pos_bias_u = Tensor::zeros((num_heads, head_dim), DType::F32, device)?;
+        let pos_bias_v = Tensor::zeros((num_heads, head_dim), DType::F32, device)?;
 
         Ok(Self {
             layer_norm,
@@ -208,6 +218,9 @@ impl MultiHeadAttention {
             k_proj,
             v_proj,
             out_proj,
+            linear_pos,
+            pos_bias_u,
+            pos_bias_v,
             num_heads,
             head_dim,
         })
@@ -257,12 +270,53 @@ impl MultiHeadAttention {
             Some(&format!("{}.linear_out.bias", prefix)),
         )?;
 
+        // Relative position components
+        let linear_pos_key = format!("{}.linear_pos.weight", prefix);
+        let linear_pos = match load_linear(tensors, &linear_pos_key, None) {
+            Ok(l) => l,
+            Err(_) => {
+                tracing::warn!(
+                    "[Conformer] Missing tensor '{}', using random initialization",
+                    linear_pos_key
+                );
+                let w = Tensor::randn(0.0f32, 0.02, (dim, dim), device)?;
+                Linear::new(w, None)
+            }
+        };
+
+        let pos_bias_u_key = format!("{}.pos_bias_u", prefix);
+        let pos_bias_u = match tensors.get(&pos_bias_u_key) {
+            Some(t) => t.clone(),
+            None => {
+                tracing::warn!(
+                    "[Conformer] Missing tensor '{}', using zeros",
+                    pos_bias_u_key
+                );
+                Tensor::zeros((num_heads, head_dim), DType::F32, device)?
+            }
+        };
+
+        let pos_bias_v_key = format!("{}.pos_bias_v", prefix);
+        let pos_bias_v = match tensors.get(&pos_bias_v_key) {
+            Some(t) => t.clone(),
+            None => {
+                tracing::warn!(
+                    "[Conformer] Missing tensor '{}', using zeros",
+                    pos_bias_v_key
+                );
+                Tensor::zeros((num_heads, head_dim), DType::F32, device)?
+            }
+        };
+
         Ok(Self {
             layer_norm,
             q_proj,
             k_proj,
             v_proj,
             out_proj,
+            linear_pos,
+            pos_bias_u,
+            pos_bias_v,
             num_heads,
             head_dim,
         })
@@ -281,12 +335,21 @@ impl MultiHeadAttention {
             Ok(Linear::new(w, Some(b)))
         };
 
+        // Relative position components
+        let linear_pos_w = Tensor::randn(0.0f32, 0.02, (dim, dim), device)?;
+        let linear_pos = Linear::new(linear_pos_w, None);
+        let pos_bias_u = Tensor::zeros((num_heads, head_dim), DType::F32, device)?;
+        let pos_bias_v = Tensor::zeros((num_heads, head_dim), DType::F32, device)?;
+
         Ok(Self {
             layer_norm,
             q_proj: make_linear(device)?,
             k_proj: make_linear(device)?,
             v_proj: make_linear(device)?,
             out_proj: make_linear(device)?,
+            linear_pos,
+            pos_bias_u,
+            pos_bias_v,
             num_heads,
             head_dim,
         })

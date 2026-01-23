@@ -45,6 +45,8 @@ fn load_linear(
 }
 
 /// Cross-attention layer: queries attend to keys/values from encoder
+/// Supports asymmetric dimensions where Q projects from latent_dim to attn_dim,
+/// K/V project from latent_dim (context) to attn_dim, and output projects back.
 struct CrossAttention {
     q_proj: Linear,
     k_proj: Linear,
@@ -52,15 +54,20 @@ struct CrossAttention {
     out_proj: Linear,
     num_heads: usize,
     head_dim: usize,
+    /// Internal attention dimension (512), different from latent dim (1280)
+    attn_dim: usize,
 }
 
 impl CrossAttention {
-    fn new(dim: usize, num_heads: usize, vb: VarBuilder) -> Result<Self> {
-        let head_dim = dim / num_heads;
-        let q_proj = candle_nn::linear(dim, dim, vb.pp("q_proj"))?;
-        let k_proj = candle_nn::linear(dim, dim, vb.pp("k_proj"))?;
-        let v_proj = candle_nn::linear(dim, dim, vb.pp("v_proj"))?;
-        let out_proj = candle_nn::linear(dim, dim, vb.pp("out_proj"))?;
+    fn new(latent_dim: usize, attn_dim: usize, num_heads: usize, vb: VarBuilder) -> Result<Self> {
+        let head_dim = attn_dim / num_heads;
+        // Q projects from latent_dim to attn_dim
+        let q_proj = candle_nn::linear(latent_dim, attn_dim, vb.pp("q_proj"))?;
+        // K/V project from latent_dim (context) to attn_dim
+        let k_proj = candle_nn::linear(latent_dim, attn_dim, vb.pp("k_proj"))?;
+        let v_proj = candle_nn::linear(latent_dim, attn_dim, vb.pp("v_proj"))?;
+        // Output projects from attn_dim back to latent_dim
+        let out_proj = candle_nn::linear(attn_dim, latent_dim, vb.pp("out_proj"))?;
 
         Ok(Self {
             q_proj,
@@ -69,53 +76,73 @@ impl CrossAttention {
             out_proj,
             num_heads,
             head_dim,
+            attn_dim,
         })
     }
 
     /// Load from GPT checkpoint tensors
     /// GPT format: layers.{i}.0.to_q, layers.{i}.0.to_kv (fused K+V), layers.{i}.0.to_out
+    ///
+    /// Checkpoint dimensions:
+    /// - to_q: [attn_dim, latent_dim] = [512, 1280]
+    /// - to_kv: [2*attn_dim, latent_dim] = [1024, 1280] (fused K+V)
+    /// - to_out: [latent_dim, attn_dim] = [1280, 512]
     fn from_gpt_tensors(
         tensors: &HashMap<String, Tensor>,
         prefix: &str,
-        dim: usize,
+        latent_dim: usize,    // 1280
+        attn_dim: usize,      // 512
         num_heads: usize,
         device: &Device,
     ) -> Result<Self> {
-        let head_dim = dim / num_heads;
+        let head_dim = attn_dim / num_heads;  // 512/8 = 64
 
-        // Q projection
-        // candle_nn::Linear expects PyTorch format and handles transpose internally
-        let q_proj = load_linear(
-            tensors,
-            &format!("{}.to_q.weight", prefix),
-            None,
-        )?;
+        // Q projection: latent_dim -> attn_dim (1280 -> 512)
+        let q_key = format!("{}.to_q.weight", prefix);
+        let q_proj = match tensors.get(&q_key) {
+            Some(w) => {
+                eprintln!("    CrossAttn Q: {:?}", w.dims());
+                Linear::new(w.clone(), None)
+            }
+            None => {
+                tracing::warn!("[Perceiver] Missing '{}', using random initialization", q_key);
+                let w = Tensor::randn(0.0f32, 0.02, (attn_dim, latent_dim), device)?;
+                Linear::new(w, None)
+            }
+        };
 
-        // KV is fused as [2*head_dim*num_heads, context_dim]
+        // KV is fused as [2*attn_dim, latent_dim] = [1024, 1280]
         // We need to split it into K and V
-        // candle_nn::Linear expects PyTorch format [out_features, in_features]
-        // so we keep the sliced weights as-is (no transpose)
         let kv_key = format!("{}.to_kv.weight", prefix);
         let (k_proj, v_proj) = if let Some(kv_weight) = tensors.get(&kv_key) {
             // Split the fused KV weight along first dimension
-            let (kv_dim, _ctx_dim) = kv_weight.dims2()?;
-            let half_dim = kv_dim / 2;
+            let (kv_dim, _) = kv_weight.dims2()?;
+            let half_dim = kv_dim / 2;  // 512
             let k_weight = kv_weight.i((0..half_dim, ..))?.contiguous()?;
             let v_weight = kv_weight.i((half_dim..kv_dim, ..))?.contiguous()?;
+            eprintln!("    CrossAttn K/V: [{}, {}] split from [{}, {}]", half_dim, kv_weight.dim(1)?, kv_dim, kv_weight.dim(1)?);
             (Linear::new(k_weight, None), Linear::new(v_weight, None))
         } else {
-            // Fallback to random - use PyTorch format [out_features, in_features]
-            let w_k = Tensor::randn(0.0f32, 0.02, (dim, dim), device)?;
-            let w_v = Tensor::randn(0.0f32, 0.02, (dim, dim), device)?;
+            // Fallback to random
+            tracing::warn!("[Perceiver] Missing '{}', using random initialization", kv_key);
+            let w_k = Tensor::randn(0.0f32, 0.02, (attn_dim, latent_dim), device)?;
+            let w_v = Tensor::randn(0.0f32, 0.02, (attn_dim, latent_dim), device)?;
             (Linear::new(w_k, None), Linear::new(w_v, None))
         };
 
-        // Output projection
-        let out_proj = load_linear(
-            tensors,
-            &format!("{}.to_out.weight", prefix),
-            None,
-        )?;
+        // Output projection: attn_dim -> latent_dim (512 -> 1280)
+        let out_key = format!("{}.to_out.weight", prefix);
+        let out_proj = match tensors.get(&out_key) {
+            Some(w) => {
+                eprintln!("    CrossAttn Out: {:?}", w.dims());
+                Linear::new(w.clone(), None)
+            }
+            None => {
+                tracing::warn!("[Perceiver] Missing '{}', using random initialization", out_key);
+                let w = Tensor::randn(0.0f32, 0.02, (latent_dim, attn_dim), device)?;
+                Linear::new(w, None)
+            }
+        };
 
         Ok(Self {
             q_proj,
@@ -124,43 +151,49 @@ impl CrossAttention {
             out_proj,
             num_heads,
             head_dim,
+            attn_dim,
         })
     }
 
-    fn new_random(dim: usize, num_heads: usize, device: &Device) -> Result<Self> {
-        let head_dim = dim / num_heads;
+    fn new_random(latent_dim: usize, attn_dim: usize, num_heads: usize, device: &Device) -> Result<Self> {
+        let head_dim = attn_dim / num_heads;
 
-        let make_linear = |device: &Device| -> Result<Linear> {
-            let w = Tensor::randn(0.0f32, 0.02, (dim, dim), device)?;
-            let b = Tensor::zeros((dim,), DType::F32, device)?;
-            Ok(Linear::new(w, Some(b)))
-        };
+        // Q: latent_dim -> attn_dim
+        let w_q = Tensor::randn(0.0f32, 0.02, (attn_dim, latent_dim), device)?;
+        // K/V: latent_dim -> attn_dim (context is projected to latent_dim first)
+        let w_k = Tensor::randn(0.0f32, 0.02, (attn_dim, latent_dim), device)?;
+        let w_v = Tensor::randn(0.0f32, 0.02, (attn_dim, latent_dim), device)?;
+        // Out: attn_dim -> latent_dim
+        let w_out = Tensor::randn(0.0f32, 0.02, (latent_dim, attn_dim), device)?;
 
         Ok(Self {
-            q_proj: make_linear(device)?,
-            k_proj: make_linear(device)?,
-            v_proj: make_linear(device)?,
-            out_proj: make_linear(device)?,
+            q_proj: Linear::new(w_q, None),
+            k_proj: Linear::new(w_k, None),
+            v_proj: Linear::new(w_v, None),
+            out_proj: Linear::new(w_out, None),
             num_heads,
             head_dim,
+            attn_dim,
         })
     }
 
     /// Cross-attention forward
     ///
     /// # Arguments
-    /// * `queries` - Query tensor (batch, num_latents, dim)
-    /// * `context` - Key/value context from encoder (batch, seq_len, dim)
+    /// * `queries` - Query tensor (batch, num_latents, latent_dim) where latent_dim = 1280
+    /// * `context` - Key/value context from encoder (batch, seq_len, latent_dim) - already projected to 1280
+    ///
+    /// Q projects to attn_dim (512), K/V project to attn_dim (512), output projects back to latent_dim (1280)
     fn forward(&self, queries: &Tensor, context: &Tensor) -> Result<Tensor> {
         let (batch_size, num_latents, _) = queries.dims3()?;
         let (_, ctx_len, _) = context.dims3()?;
 
-        // Project queries, keys, values
-        let q = self.q_proj.forward(queries)?;
-        let k = self.k_proj.forward(context)?;
-        let v = self.v_proj.forward(context)?;
+        // Project queries, keys, values - all to attn_dim (512)
+        let q = self.q_proj.forward(queries)?;   // [batch, num_latents, attn_dim]
+        let k = self.k_proj.forward(context)?;   // [batch, ctx_len, attn_dim]
+        let v = self.v_proj.forward(context)?;   // [batch, ctx_len, attn_dim]
 
-        // Reshape for multi-head attention
+        // Reshape for multi-head attention using attn_dim
         let q = q
             .reshape((batch_size, num_latents, self.num_heads, self.head_dim))?
             .transpose(1, 2)?; // (batch, heads, num_latents, head_dim)
@@ -185,12 +218,13 @@ impl CrossAttention {
 
         let attn_output = attn_weights.contiguous()?.matmul(&v)?;
 
-        // Reshape back
+        // Reshape back - output is [batch, num_latents, attn_dim]
         let attn_output = attn_output
             .transpose(1, 2)?
             .contiguous()?
-            .reshape((batch_size, num_latents, self.num_heads * self.head_dim))?;
+            .reshape((batch_size, num_latents, self.attn_dim))?;
 
+        // Project back to latent_dim (1280)
         self.out_proj.forward(&attn_output).map_err(Into::into)
     }
 }
@@ -372,8 +406,8 @@ struct PerceiverLayer {
 }
 
 impl PerceiverLayer {
-    fn new(dim: usize, num_heads: usize, ff_mult: usize, vb: VarBuilder) -> Result<Self> {
-        let cross_attn = CrossAttention::new(dim, num_heads, vb.pp("cross_attn"))?;
+    fn new(dim: usize, attn_dim: usize, num_heads: usize, ff_mult: usize, vb: VarBuilder) -> Result<Self> {
+        let cross_attn = CrossAttention::new(dim, attn_dim, num_heads, vb.pp("cross_attn"))?;
         let cross_norm = candle_nn::layer_norm(dim, 1e-5, vb.pp("cross_norm"))?;
         let self_attn = SelfAttention::new(dim, num_heads, vb.pp("self_attn"))?;
         let self_norm = candle_nn::layer_norm(dim, 1e-5, vb.pp("self_norm"))?;
@@ -397,6 +431,7 @@ impl PerceiverLayer {
         tensors: &HashMap<String, Tensor>,
         layer_idx: usize,
         dim: usize,
+        attn_dim: usize,
         num_heads: usize,
         _ff_mult: usize,
         device: &Device,
@@ -408,6 +443,7 @@ impl PerceiverLayer {
             tensors,
             &format!("{}.0", prefix),
             dim,
+            attn_dim,
             num_heads,
             device,
         )?;
@@ -439,8 +475,8 @@ impl PerceiverLayer {
         })
     }
 
-    fn new_random(dim: usize, num_heads: usize, ff_mult: usize, device: &Device) -> Result<Self> {
-        let cross_attn = CrossAttention::new_random(dim, num_heads, device)?;
+    fn new_random(dim: usize, attn_dim: usize, num_heads: usize, ff_mult: usize, device: &Device) -> Result<Self> {
+        let cross_attn = CrossAttention::new_random(dim, attn_dim, num_heads, device)?;
         let self_attn = SelfAttention::new_random(dim, num_heads, device)?;
         let ffn = FeedForward::new_random(dim, ff_mult, device)?;
 
@@ -477,21 +513,32 @@ impl PerceiverLayer {
 
 /// Perceiver resampler configuration
 pub struct PerceiverConfig {
+    /// Latent dimension: 1280 (dimension of latent queries)
     pub dim: usize,
+    /// Input context dimension from Conformer: 512
+    pub context_dim: usize,
+    /// Number of latent queries: 32
     pub num_latents: usize,
+    /// Number of attention heads: 8
     pub num_heads: usize,
+    /// Number of perceiver layers: 2
     pub num_layers: usize,
+    /// FFN multiplier (not used with SwiGLU but kept for API compat)
     pub ff_mult: usize,
+    /// Internal attention dimension: 512
+    pub attn_dim: usize,
 }
 
 impl Default for PerceiverConfig {
     fn default() -> Self {
         Self {
-            dim: 512,
+            dim: 1280,           // Latent dimension
+            context_dim: 512,    // Input context dimension from Conformer
             num_latents: 32,
             num_heads: 8,
             num_layers: 2,
             ff_mult: 4,
+            attn_dim: 512,       // Internal attention dimension
         }
     }
 }
@@ -509,6 +556,10 @@ pub struct PerceiverResampler {
     layers: Vec<PerceiverLayer>,
     /// Output projection (if dim mismatch)
     output_proj: Option<Linear>,
+    /// Context projection: context_dim (512) -> dim (1280)
+    proj_context: Option<Linear>,
+    /// Final norm (gamma only, no beta)
+    final_norm: Option<LayerNorm>,
     /// Whether initialized
     weights_loaded: bool,
 }
@@ -527,6 +578,8 @@ impl PerceiverResampler {
             latents: None,
             layers: Vec::new(),
             output_proj: None,
+            proj_context: None,
+            final_norm: None,
             weights_loaded: false,
         })
     }
@@ -553,6 +606,7 @@ impl PerceiverResampler {
         for _ in 0..self.config.num_layers {
             let layer = PerceiverLayer::new_random(
                 self.config.dim,
+                self.config.attn_dim,
                 self.config.num_heads,
                 self.config.ff_mult,
                 &self.device,
@@ -601,6 +655,7 @@ impl PerceiverResampler {
             for i in 0..self.config.num_layers {
                 let layer = PerceiverLayer::new(
                     self.config.dim,
+                    self.config.attn_dim,
                     self.config.num_heads,
                     self.config.ff_mult,
                     vb.pp(&format!("layers.{}", i)),
@@ -626,6 +681,7 @@ impl PerceiverResampler {
             self.config.num_latents = num_latents;
             self.config.dim = dim;
         } else {
+            tracing::warn!("[Perceiver] Missing latents, using random initialization");
             // Fallback to random latents
             self.latents = Some(Tensor::randn(
                 0.0f32,
@@ -634,6 +690,38 @@ impl PerceiverResampler {
                 &self.device,
             )?);
         }
+
+        // Load proj_context: context_dim (512) -> dim (1280)
+        let proj_context_key = "perceiver_encoder.proj_context.weight";
+        self.proj_context = match tensors.get(proj_context_key) {
+            Some(weight) => {
+                let bias_key = "perceiver_encoder.proj_context.bias";
+                let bias = tensors.get(bias_key).cloned();
+                let (out_dim, in_dim) = weight.dims2()?;
+                // Update context_dim based on loaded weight
+                self.config.context_dim = in_dim;
+                eprintln!("  Loaded proj_context: [{}, {}] (context_dim -> dim)", out_dim, in_dim);
+                Some(Linear::new(weight.clone(), bias))
+            }
+            None => {
+                tracing::warn!("[Perceiver] Missing proj_context, context dim must match latent dim");
+                None
+            }
+        };
+
+        // Load final norm (gamma only, no beta!)
+        let final_norm_key = "perceiver_encoder.norm.gamma";
+        self.final_norm = match tensors.get(final_norm_key) {
+            Some(gamma) => {
+                let beta = Tensor::zeros_like(gamma)?;
+                eprintln!("  Loaded final_norm (gamma only): {:?}", gamma.dims());
+                Some(LayerNorm::new(gamma.clone(), beta, 1e-5))
+            }
+            None => {
+                tracing::warn!("[Perceiver] Missing final norm gamma");
+                None
+            }
+        };
 
         // Count available layers
         let num_layers = (0..10)
@@ -651,6 +739,7 @@ impl PerceiverResampler {
                     tensors,
                     i,
                     self.config.dim,
+                    self.config.attn_dim,
                     self.config.num_heads,
                     self.config.ff_mult,
                     &self.device,
@@ -663,6 +752,7 @@ impl PerceiverResampler {
                         eprintln!("  Warning: Failed to load perceiver layer {}: {}", i, e);
                         let layer = PerceiverLayer::new_random(
                             self.config.dim,
+                            self.config.attn_dim,
                             self.config.num_heads,
                             self.config.ff_mult,
                             &self.device,
@@ -674,6 +764,7 @@ impl PerceiverResampler {
                 // Create random layer for remaining layers
                 let layer = PerceiverLayer::new_random(
                     self.config.dim,
+                    self.config.attn_dim,
                     self.config.num_heads,
                     self.config.ff_mult,
                     &self.device,
@@ -683,16 +774,17 @@ impl PerceiverResampler {
         }
 
         eprintln!("  Successfully loaded {} of {} perceiver layers", loaded_count, num_layers);
+        self.weights_loaded = true;
         Ok(())
     }
 
     /// Forward pass
     ///
     /// # Arguments
-    /// * `context` - Encoder output (batch, seq_len, dim)
+    /// * `context` - Encoder output (batch, seq_len, context_dim) where context_dim=512 from Conformer
     ///
     /// # Returns
-    /// * Resampled conditioning (batch, num_latents, dim)
+    /// * Resampled conditioning (batch, num_latents, dim) where dim=1280
     pub fn forward(&self, context: &Tensor) -> Result<Tensor> {
         let batch_size = context.dim(0)?;
 
@@ -705,6 +797,13 @@ impl PerceiverResampler {
             .map_err(Into::into);
         }
 
+        // Project context from Conformer dim (512) to latent dim (1280)
+        let context = if let Some(ref proj) = self.proj_context {
+            proj.forward(context)?
+        } else {
+            context.clone()
+        };
+
         // Expand latents to batch size
         let latents = self
             .latents
@@ -715,7 +814,12 @@ impl PerceiverResampler {
 
         // Process through perceiver layers
         for layer in &self.layers {
-            latents = layer.forward(&latents, context)?;
+            latents = layer.forward(&latents, &context)?;
+        }
+
+        // Apply final norm (gamma only)
+        if let Some(ref norm) = self.final_norm {
+            latents = norm.forward(&latents)?;
         }
 
         // Optional output projection
@@ -749,7 +853,8 @@ mod tests {
     #[test]
     fn test_perceiver_config_default() {
         let config = PerceiverConfig::default();
-        assert_eq!(config.dim, 512);
+        assert_eq!(config.dim, 1280);
+        assert_eq!(config.attn_dim, 512);
         assert_eq!(config.num_latents, 32);
     }
 
@@ -758,7 +863,7 @@ mod tests {
         let device = Device::Cpu;
         let resampler = PerceiverResampler::new(&device).unwrap();
         assert_eq!(resampler.num_latents(), 32);
-        assert_eq!(resampler.output_dim(), 512);
+        assert_eq!(resampler.output_dim(), 1280);
     }
 
     #[test]
@@ -766,11 +871,12 @@ mod tests {
         let device = Device::Cpu;
         let resampler = PerceiverResampler::new(&device).unwrap();
 
-        let context = Tensor::randn(0.0f32, 1.0, (2, 100, 512), &device).unwrap();
+        // Context is projected to dim (1280) before being passed
+        let context = Tensor::randn(0.0f32, 1.0, (2, 100, 1280), &device).unwrap();
         let out = resampler.forward(&context).unwrap();
 
         // Output should be (batch, num_latents, dim)
-        assert_eq!(out.dims3().unwrap(), (2, 32, 512));
+        assert_eq!(out.dims3().unwrap(), (2, 32, 1280));
     }
 
     #[test]
@@ -781,21 +887,25 @@ mod tests {
 
         assert!(resampler.is_initialized());
 
-        let context = Tensor::randn(0.0f32, 1.0, (1, 50, 512), &device).unwrap();
+        // Context is projected to dim (1280) before being passed
+        let context = Tensor::randn(0.0f32, 1.0, (1, 50, 1280), &device).unwrap();
         let out = resampler.forward(&context).unwrap();
 
-        assert_eq!(out.dims3().unwrap(), (1, 32, 512));
+        assert_eq!(out.dims3().unwrap(), (1, 32, 1280));
     }
 
     #[test]
     fn test_cross_attention() {
         let device = Device::Cpu;
-        let attn = CrossAttention::new_random(512, 8, &device).unwrap();
+        // latent_dim=1280, attn_dim=512, num_heads=8
+        let attn = CrossAttention::new_random(1280, 512, 8, &device).unwrap();
 
-        let queries = Tensor::randn(0.0f32, 1.0, (2, 32, 512), &device).unwrap();
-        let context = Tensor::randn(0.0f32, 1.0, (2, 100, 512), &device).unwrap();
+        // queries and context are at latent_dim (1280)
+        let queries = Tensor::randn(0.0f32, 1.0, (2, 32, 1280), &device).unwrap();
+        let context = Tensor::randn(0.0f32, 1.0, (2, 100, 1280), &device).unwrap();
 
         let out = attn.forward(&queries, &context).unwrap();
-        assert_eq!(out.dims3().unwrap(), (2, 32, 512));
+        // Output is at latent_dim (1280)
+        assert_eq!(out.dims3().unwrap(), (2, 32, 1280));
     }
 }

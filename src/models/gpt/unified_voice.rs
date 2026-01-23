@@ -17,11 +17,13 @@
 use anyhow::Result;
 use candle_core::{Device, Tensor, DType, D, IndexOp};
 use candle_nn::{Linear, Module, VarBuilder, LayerNorm};
+use std::collections::HashMap;
 use std::path::Path;
 
 use super::conformer::{ConformerEncoder, ConformerConfig};
 use super::perceiver::{PerceiverResampler, PerceiverConfig};
 use super::kv_cache::{KVCache, LayerCache};
+use super::weights::{load_safetensors, load_embedding, load_layer_norm, Gpt2LayerWeights};
 
 /// GPT-2 decoder layer
 struct DecoderLayer {
@@ -97,6 +99,26 @@ impl DecoderLayer {
         })
     }
 
+    /// Create from loaded weights
+    fn from_weights(weights: Gpt2LayerWeights, num_heads: usize) -> Result<Self> {
+        // Infer head_dim from the q_proj weight shape
+        let (out_dim, _in_dim) = weights.q_proj.weight().dims2()?;
+        let head_dim = out_dim / num_heads;
+
+        Ok(Self {
+            q_proj: weights.q_proj,
+            k_proj: weights.k_proj,
+            v_proj: weights.v_proj,
+            out_proj: weights.out_proj,
+            attn_layer_norm: weights.attn_ln,
+            fc1: weights.fc1,
+            fc2: weights.fc2,
+            ffn_layer_norm: weights.ffn_ln,
+            num_heads,
+            head_dim,
+        })
+    }
+
     /// Forward pass with KV cache support
     fn forward(
         &self,
@@ -124,13 +146,19 @@ impl DecoderLayer {
             .reshape((batch_size, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
 
+        // Make tensors contiguous before KV cache
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+
         // KV cache
         let (k, v) = cache.append(&k, &v)?;
         let kv_len = k.dim(2)?;
 
         // Attention
         let scale = (self.head_dim as f64).sqrt();
-        let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        let attn = q.matmul(&k_t)?;
         let attn = (attn / scale)?;
 
         // Causal mask
@@ -144,10 +172,12 @@ impl DecoderLayer {
         };
 
         let attn = candle_nn::ops::softmax(&attn, D::Minus1)?;
-        let attn_out = attn.matmul(&v)?;
+        let v = v.contiguous()?;
+        let attn_out = attn.contiguous()?.matmul(&v)?;
 
         let attn_out = attn_out
             .transpose(1, 2)?
+            .contiguous()?
             .reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
         let attn_out = self.out_proj.forward(&attn_out)?;
 
@@ -322,10 +352,12 @@ impl UnifiedVoice {
         let mut perceiver = PerceiverResampler::with_config(
             PerceiverConfig {
                 dim,
+                context_dim: 512,
                 num_latents: 32,
                 num_heads: 8,
                 num_layers: 2,
                 ff_mult: 4,
+                attn_dim: 512,
             },
             &self.device,
         )?;
@@ -353,16 +385,141 @@ impl UnifiedVoice {
         Ok(())
     }
 
-    /// Load weights from file
+    /// Load weights from safetensors file
     pub fn load_weights<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path = path.as_ref();
 
         if !path.exists() {
+            eprintln!("Warning: Checkpoint not found at {:?}, using random weights", path);
             return self.initialize_random();
         }
 
-        // For now, initialize with random - in production would load actual weights
-        self.initialize_random()
+        eprintln!("Loading GPT weights from {:?}...", path);
+        let tensors = load_safetensors(path, &self.device)?;
+
+        let dim = self.config.model_dim;
+
+        // Load embeddings
+        self.text_embedding = Some(load_embedding(
+            &tensors,
+            "text_embedding.weight",
+            Some(self.config.number_text_tokens),
+            dim,
+            &self.device,
+        )?);
+
+        self.mel_embedding = Some(load_embedding(
+            &tensors,
+            "mel_embedding.weight",
+            Some(self.config.number_mel_codes),
+            dim,
+            &self.device,
+        )?);
+
+        // Combine text and mel positional embeddings
+        let text_pos = tensors
+            .get("text_pos_embedding.emb.weight")
+            .ok_or_else(|| anyhow::anyhow!("text_pos_embedding not found"))?;
+        let mel_pos = tensors
+            .get("mel_pos_embedding.emb.weight")
+            .ok_or_else(|| anyhow::anyhow!("mel_pos_embedding not found"))?;
+
+        // Concatenate: [text_pos (602), mel_pos (1818)] for combined position embedding
+        self.pos_embedding = Some(Tensor::cat(&[text_pos, mel_pos], 0)?);
+
+        // Load decoder layers
+        self.decoder_layers.clear();
+        for i in 0..self.config.num_layers {
+            let layer_weights = Gpt2LayerWeights::load(
+                &tensors,
+                i,
+                dim,
+                &self.device,
+            )?;
+            let layer = DecoderLayer::from_weights(layer_weights, self.config.num_heads)?;
+            self.decoder_layers.push(layer);
+        }
+
+        // Final layer norm (gpt.ln_f)
+        self.final_layer_norm = Some(load_layer_norm(
+            &tensors,
+            "gpt.ln_f.weight",
+            Some("gpt.ln_f.bias"),
+            1e-5,
+            &self.device,
+        )?);
+
+        // LM head (mel_head) - need to transpose for candle
+        let mel_head_weight = tensors
+            .get("mel_head.weight")
+            .ok_or_else(|| anyhow::anyhow!("mel_head.weight not found"))?
+            .clone();
+        let mel_head_bias = tensors.get("mel_head.bias").cloned();
+        self.lm_head = Some(Linear::new(mel_head_weight, mel_head_bias));
+
+        // Note: Conformer and Perceiver loading requires separate implementation
+        // For now, initialize them randomly (they'll need their own load methods)
+        self.load_conformer_weights(&tensors)?;
+        self.load_perceiver_weights(&tensors)?;
+
+        self.weights_loaded = true;
+        eprintln!("GPT weights loaded successfully: {} layers", self.config.num_layers);
+        Ok(())
+    }
+
+    /// Load conformer encoder weights
+    #[allow(unused_variables)]
+    fn load_conformer_weights(&mut self, tensors: &HashMap<String, Tensor>) -> Result<()> {
+        // Initialize conformer with random weights for now
+        // Full implementation would extract conditioning_encoder.* weights
+        let mut conformer = ConformerEncoder::with_config(
+            ConformerConfig {
+                input_dim: 80,
+                output_dim: self.config.model_dim,
+                num_blocks: 6,
+                num_heads: 8,
+                ff_expansion: 4,
+                conv_kernel_size: 31,
+            },
+            &self.device,
+        )?;
+
+        // TODO: Load actual conformer weights from tensors
+        // Keys: conditioning_encoder.encoders.{n}.*
+        conformer.initialize_random()?;
+        self.conformer = Some(conformer);
+        Ok(())
+    }
+
+    /// Load perceiver resampler weights from GPT checkpoint tensors
+    fn load_perceiver_weights(&mut self, tensors: &HashMap<String, Tensor>) -> Result<()> {
+        // Check if perceiver_encoder weights exist in checkpoint
+        let has_perceiver = tensors.keys().any(|k| k.starts_with("perceiver_encoder"));
+
+        let mut perceiver = PerceiverResampler::with_config(
+            PerceiverConfig {
+                dim: self.config.model_dim,
+                context_dim: 512,
+                num_latents: 32,
+                num_heads: 20,  // Match GPT's 20 heads
+                num_layers: 2,
+                ff_mult: 4,
+                attn_dim: 512,
+            },
+            &self.device,
+        )?;
+
+        if has_perceiver {
+            // Load from GPT tensors using perceiver's own loader
+            perceiver.load_from_gpt_tensors(tensors)?;
+            eprintln!("  Perceiver weights loaded from checkpoint");
+        } else {
+            eprintln!("  Warning: No perceiver_encoder weights found, using random");
+            perceiver.initialize_random()?;
+        }
+
+        self.perceiver = Some(perceiver);
+        Ok(())
     }
 
     /// Initialize KV cache for generation
@@ -421,6 +578,37 @@ impl UnifiedVoice {
 
         // Perceiver resamples to fixed length conditioning
         perceiver.forward(&encoded)
+    }
+
+    /// Embed mel codes to continuous features
+    ///
+    /// # Arguments
+    /// * `mel_codes` - Mel code IDs (batch, seq_len) as u32
+    ///
+    /// # Returns
+    /// * Mel embeddings (batch, seq_len, 1280)
+    pub fn embed_mel_codes(&self, mel_codes: &Tensor) -> Result<Tensor> {
+        let emb = self
+            .mel_embedding
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Mel embedding not initialized"))?;
+
+        // Debug: Check embedding table statistics
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let emb_mean: f32 = emb.mean_all().unwrap().to_scalar().unwrap();
+            let emb_var: f32 = emb.var(candle_core::D::Minus1).unwrap().mean_all().unwrap().to_scalar().unwrap();
+            let emb_shape = emb.shape();
+            eprintln!("DEBUG: mel_embedding table shape={:?}, mean={:.6}, var={:.6}", emb_shape, emb_mean, emb_var);
+        });
+
+        let (batch_size, seq_len) = mel_codes.dims2()?;
+        let flat = mel_codes.flatten_all()?;
+        let embedded = emb.index_select(&flat, 0)?;
+
+        embedded.reshape((batch_size, seq_len, self.config.model_dim))
+            .map_err(Into::into)
     }
 
     /// Forward pass for training (full sequence)
@@ -552,7 +740,17 @@ impl UnifiedVoice {
         let mut hidden = hidden.reshape((batch_size, 1, self.config.model_dim))?;
 
         // Add positional embedding
-        let pos_emb = self.embed_pos(1, position)?;
+        // The positional embeddings are concatenated: [text_pos (602), mel_pos (1818)]
+        // For text tokens, use position directly (0 to max_text_tokens)
+        // For mel tokens, use position + text_pos_size (602) to access mel_pos_embedding
+        let text_pos_size = self.config.max_text_tokens + 2; // 602
+        let pos_index = if is_mel {
+            // Mel tokens use mel_pos_embedding, which starts at index text_pos_size
+            text_pos_size + position
+        } else {
+            position
+        };
+        let pos_emb = self.embed_pos(1, pos_index)?;
         let pos_emb = pos_emb.unsqueeze(0)?.broadcast_as(hidden.shape())?;
         hidden = (hidden + pos_emb)?;
 
@@ -606,6 +804,96 @@ impl UnifiedVoice {
     /// Check if initialized
     pub fn is_initialized(&self) -> bool {
         self.weights_loaded
+    }
+
+    /// Forward pass for generation (single token with KV cache) returning both logits and hidden states
+    ///
+    /// # Arguments
+    /// * `input_id` - Current token ID (batch, 1)
+    /// * `position` - Current position in sequence
+    /// * `is_mel` - Whether this is a mel token (vs text token)
+    ///
+    /// # Returns
+    /// * Tuple of (logits, hidden_states):
+    ///   - logits: (batch, number_mel_codes)
+    ///   - hidden_states: (batch, 1, model_dim) - the hidden state before lm_head projection
+    pub fn forward_one_with_hidden(
+        &mut self,
+        input_id: &Tensor,
+        position: usize,
+        is_mel: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        if !self.weights_loaded {
+            let batch = input_id.dim(0)?;
+            let logits = Tensor::zeros(
+                (batch, self.config.number_mel_codes),
+                DType::F32,
+                &self.device,
+            )?;
+            let hidden = Tensor::zeros(
+                (batch, 1, self.config.model_dim),
+                DType::F32,
+                &self.device,
+            )?;
+            return Ok((logits, hidden));
+        }
+
+        // Ensure cache is initialized
+        if self.kv_cache.is_none() {
+            self.init_cache();
+        }
+
+        let batch_size = input_id.dim(0)?;
+
+        // Embed the token
+        let flat_id = input_id.flatten_all()?;
+        let hidden = if is_mel {
+            self.embed_mel(&flat_id)?
+        } else {
+            self.embed_text(&flat_id)?
+        };
+        let mut hidden = hidden.reshape((batch_size, 1, self.config.model_dim))?;
+
+        // Add positional embedding
+        let text_pos_size = self.config.max_text_tokens + 2;
+        let pos_index = if is_mel {
+            text_pos_size + position
+        } else {
+            position
+        };
+        let pos_emb = self.embed_pos(1, pos_index)?;
+        let pos_emb = pos_emb.unsqueeze(0)?.broadcast_as(hidden.shape())?;
+        hidden = (hidden + pos_emb)?;
+
+        // Process through decoder layers with KV cache
+        let cache = self.kv_cache.as_mut().unwrap();
+        for (i, layer) in self.decoder_layers.iter().enumerate() {
+            let layer_cache = cache.get_layer_cache_mut(i)
+                .ok_or_else(|| anyhow::anyhow!("Layer cache {} not found", i))?;
+            hidden = layer.forward(&hidden, layer_cache, true)?;
+        }
+
+        // Final layer norm
+        if let Some(ref ln) = self.final_layer_norm {
+            hidden = ln.forward(&hidden)?;
+        }
+
+        // Save hidden states before projection (shape: batch, 1, model_dim)
+        let hidden_states = hidden.clone();
+
+        // Squeeze out sequence dimension and project to logits
+        let hidden = hidden.squeeze(1)?;
+        let logits = if let Some(ref lm_head) = self.lm_head {
+            lm_head.forward(&hidden)?
+        } else {
+            Tensor::zeros(
+                (batch_size, self.config.number_mel_codes),
+                DType::F32,
+                &self.device,
+            )?
+        };
+
+        Ok((logits, hidden_states))
     }
 }
 
