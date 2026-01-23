@@ -315,17 +315,26 @@ impl SelfAttention {
     }
 }
 
-/// Feed-forward network
-struct FeedForward {
-    linear1: Linear,
-    linear2: Linear,
+/// SwiGLU Feed-forward network (per checkpoint architecture)
+///
+/// SwiGLU splits the first linear output in half, applies SiLU to one half,
+/// multiplies with the other half, then projects back down.
+///
+/// Checkpoint dimensions for dim=1280:
+/// - linear1: [3412, 1280] (SwiGLU gate expansion)
+/// - linear2: [1280, 1706] (down projection from half of gate)
+struct SwiGLUFeedForward {
+    linear1: Linear,  // [gate_dim, dim] where gate_dim = 3412
+    linear2: Linear,  // [dim, gate_dim/2] where dim = 1280, gate_dim/2 = 1706
 }
 
-impl FeedForward {
-    fn new(dim: usize, mult: usize, vb: VarBuilder) -> Result<Self> {
-        let hidden = dim * mult;
-        let linear1 = candle_nn::linear(dim, hidden, vb.pp("linear1"))?;
-        let linear2 = candle_nn::linear(hidden, dim, vb.pp("linear2"))?;
+impl SwiGLUFeedForward {
+    fn new(dim: usize, _mult: usize, vb: VarBuilder) -> Result<Self> {
+        // SwiGLU uses ~2.67x expansion for gate, split in half
+        let gate_dim = 3412;  // Per checkpoint
+        let half_gate = gate_dim / 2;  // 1706
+        let linear1 = candle_nn::linear(dim, gate_dim, vb.pp("linear1"))?;
+        let linear2 = candle_nn::linear(half_gate, dim, vb.pp("linear2"))?;
         Ok(Self { linear1, linear2 })
     }
 
@@ -334,41 +343,35 @@ impl FeedForward {
     fn from_gpt_tensors(
         tensors: &HashMap<String, Tensor>,
         prefix: &str,
+        dim: usize,
         device: &Device,
     ) -> Result<Self> {
-        // linear1 is at .0
-        // candle_nn::Linear expects PyTorch format [out, in], handles transpose internally
+        // linear1 at .0 - should be [3412, 1280]
         let linear1_key = format!("{}.0.weight", prefix);
-        let linear1 = match load_linear(
-            tensors,
-            &linear1_key,
-            Some(&format!("{}.0.bias", prefix)),
-        ) {
-            Ok(l) => l,
-            Err(_) => {
-                tracing::warn!(
-                    "[Perceiver] Missing tensor '{}', using random initialization",
-                    linear1_key
-                );
-                let w = Tensor::randn(0.0f32, 0.02, (512, 512), device)?;
+        let linear1 = match tensors.get(&linear1_key) {
+            Some(w) => {
+                let bias = tensors.get(&format!("{}.0.bias", prefix)).cloned();
+                eprintln!("    SwiGLU linear1: {:?}", w.dims());
+                Linear::new(w.clone(), bias)
+            }
+            None => {
+                tracing::warn!("[Perceiver] Missing '{}', using fallback", linear1_key);
+                let w = Tensor::randn(0.0f32, 0.02, (3412, dim), device)?;
                 Linear::new(w, None)
             }
         };
 
-        // linear2 is at .2
+        // linear2 at .2 - should be [1280, 1706]
         let linear2_key = format!("{}.2.weight", prefix);
-        let linear2 = match load_linear(
-            tensors,
-            &linear2_key,
-            Some(&format!("{}.2.bias", prefix)),
-        ) {
-            Ok(l) => l,
-            Err(_) => {
-                tracing::warn!(
-                    "[Perceiver] Missing tensor '{}', using random initialization",
-                    linear2_key
-                );
-                let w = Tensor::randn(0.0f32, 0.02, (512, 512), device)?;
+        let linear2 = match tensors.get(&linear2_key) {
+            Some(w) => {
+                let bias = tensors.get(&format!("{}.2.bias", prefix)).cloned();
+                eprintln!("    SwiGLU linear2: {:?}", w.dims());
+                Linear::new(w.clone(), bias)
+            }
+            None => {
+                tracing::warn!("[Perceiver] Missing '{}', using fallback", linear2_key);
+                let w = Tensor::randn(0.0f32, 0.02, (dim, 1706), device)?;
                 Linear::new(w, None)
             }
         };
@@ -376,32 +379,47 @@ impl FeedForward {
         Ok(Self { linear1, linear2 })
     }
 
-    fn new_random(dim: usize, mult: usize, device: &Device) -> Result<Self> {
-        let hidden = dim * mult;
-        let w1 = Tensor::randn(0.0f32, 0.02, (hidden, dim), device)?;
-        let b1 = Tensor::zeros((hidden,), DType::F32, device)?;
-        let w2 = Tensor::randn(0.0f32, 0.02, (dim, hidden), device)?;
-        let b2 = Tensor::zeros((dim,), DType::F32, device)?;
+    fn new_random(dim: usize, _mult: usize, device: &Device) -> Result<Self> {
+        // SwiGLU: gate_dim is typically ~2.67x dim, here 3412 for dim=1280
+        let gate_dim = 3412;
+        let half_gate = gate_dim / 2;  // 1706
+
+        let w1 = Tensor::randn(0.0f32, 0.02, (gate_dim, dim), device)?;
+        let w2 = Tensor::randn(0.0f32, 0.02, (dim, half_gate), device)?;
+
         Ok(Self {
-            linear1: Linear::new(w1, Some(b1)),
-            linear2: Linear::new(w2, Some(b2)),
+            linear1: Linear::new(w1, None),
+            linear2: Linear::new(w2, None),
         })
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.linear1.forward(x)?;
-        let x = x.gelu_erf()?;
-        self.linear2.forward(&x).map_err(Into::into)
+        // SwiGLU activation: split, apply SiLU to gate, multiply, project down
+        let hidden = self.linear1.forward(x)?;  // [batch, seq, 3412]
+
+        // Split into gate and up projections
+        let chunks = hidden.chunk(2, D::Minus1)?;  // Each [batch, seq, 1706]
+        let gate = &chunks[0];
+        let up = &chunks[1];
+
+        // SiLU activation on gate
+        let gate = candle_nn::ops::silu(gate)?;
+
+        // Element-wise multiply
+        let hidden = (gate * up)?;  // [batch, seq, 1706]
+
+        // Project back to dim
+        self.linear2.forward(&hidden).map_err(Into::into)  // [batch, seq, 1280]
     }
 }
 
-/// Single Perceiver layer: cross-attention + self-attention + FFN
+/// Single Perceiver layer: cross-attention + self-attention + SwiGLU FFN
 struct PerceiverLayer {
     cross_attn: CrossAttention,
     cross_norm: LayerNorm,
     self_attn: SelfAttention,
     self_norm: LayerNorm,
-    ffn: FeedForward,
+    ffn: SwiGLUFeedForward,
     ffn_norm: LayerNorm,
 }
 
@@ -411,7 +429,7 @@ impl PerceiverLayer {
         let cross_norm = candle_nn::layer_norm(dim, 1e-5, vb.pp("cross_norm"))?;
         let self_attn = SelfAttention::new(dim, num_heads, vb.pp("self_attn"))?;
         let self_norm = candle_nn::layer_norm(dim, 1e-5, vb.pp("self_norm"))?;
-        let ffn = FeedForward::new(dim, ff_mult, vb.pp("ffn"))?;
+        let ffn = SwiGLUFeedForward::new(dim, ff_mult, vb.pp("ffn"))?;
         let ffn_norm = candle_nn::layer_norm(dim, 1e-5, vb.pp("ffn_norm"))?;
 
         Ok(Self {
@@ -448,10 +466,11 @@ impl PerceiverLayer {
             device,
         )?;
 
-        // FFN at .1
-        let ffn = FeedForward::from_gpt_tensors(
+        // SwiGLU FFN at .1
+        let ffn = SwiGLUFeedForward::from_gpt_tensors(
             tensors,
             &format!("{}.1", prefix),
+            dim,
             device,
         )?;
 
@@ -478,7 +497,7 @@ impl PerceiverLayer {
     fn new_random(dim: usize, attn_dim: usize, num_heads: usize, ff_mult: usize, device: &Device) -> Result<Self> {
         let cross_attn = CrossAttention::new_random(dim, attn_dim, num_heads, device)?;
         let self_attn = SelfAttention::new_random(dim, num_heads, device)?;
-        let ffn = FeedForward::new_random(dim, ff_mult, device)?;
+        let ffn = SwiGLUFeedForward::new_random(dim, ff_mult, device)?;
 
         let make_layer_norm = |device: &Device| -> Result<LayerNorm> {
             let w = Tensor::ones((dim,), DType::F32, device)?;
@@ -505,7 +524,7 @@ impl PerceiverLayer {
         let normed = self.self_norm.forward(&latents)?;
         let latents = (&latents + self.self_attn.forward(&normed)?)?;
 
-        // FFN with pre-norm
+        // SwiGLU FFN with pre-norm
         let normed = self.ffn_norm.forward(&latents)?;
         (&latents + self.ffn.forward(&normed)?).map_err(Into::into)
     }
