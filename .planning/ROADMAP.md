@@ -27,14 +27,15 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Goal**: Expose silent weight loading failures so subsequent fixes can be validated
 **Depends on**: Nothing (first phase)
 **Requirements**: None (enables other requirements)
-**Plans:** 1 plan
+**Plans:** 2 plans
 **Success Criteria** (what must be TRUE):
   1. Running inference prints actual tensor names from each safetensors file
   2. Running inference prints which tensors were found vs missing for each component
   3. Attempting to load with missing tensors produces a visible warning (not silent fallback)
 
 Plans:
-- [ ] 01-01-PLAN.md — Create WeightDiagnostics module and add tracing::warn! to silent fallbacks
+- [x] 01-01-PLAN.md — Create WeightDiagnostics module and add tracing::warn! to silent fallbacks
+- [ ] 01-02-PLAN.md — Wire WeightDiagnostics into model loading pipeline (gap closure)
 
 ### Phase 2: Wav2Vec-BERT Weights
 **Goal**: Semantic encoder loads pre-trained weights and produces meaningful embeddings
@@ -142,7 +143,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Diagnostic Infrastructure | 0/1 | Planned | - |
+| 1. Diagnostic Infrastructure | 1/2 | Gap closure needed | - |
 | 2. Wav2Vec-BERT Weights | 0/1 | Not started | - |
 | 3. GPT Components | 0/2 | Not started | - |
 | 4. DiT Weights | 0/1 | Not started | - |
