@@ -771,6 +771,7 @@ struct DiTBlock {
     attn: MultiHeadAttention,
     norm2: AdaLayerNorm,
     ff: FeedForward,
+    skip_in_linear: Option<Linear>,  // [512, 1024] for UViT skip connections
 }
 
 impl DiTBlock {
@@ -780,6 +781,7 @@ impl DiTBlock {
             attn: MultiHeadAttention::new(dim, num_heads, device)?,
             norm2: AdaLayerNorm::new(dim, device)?,
             ff: FeedForward::new(dim, device)?,
+            skip_in_linear: None,  // Not loaded in random init path
         })
     }
 
@@ -821,10 +823,36 @@ impl DiTBlock {
             device,
         )?;
 
-        Ok(Self { norm1, attn, norm2, ff })
+        // Load skip_in_linear for UViT skip connections
+        let skip_key = format!("{}.skip_in_linear.weight", prefix);
+        let skip_in_linear = match load_linear(
+            tensors,
+            &skip_key,
+            Some(&format!("{}.skip_in_linear.bias", prefix)),
+        ) {
+            Ok(linear) => {
+                // Only first block logs
+                if prefix.ends_with(".0") {
+                    eprintln!("  Loaded skip_in_linear [512, 1024]");
+                }
+                Some(linear)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "[DiT] Missing tensor '{}', skip connection disabled",
+                    skip_key
+                );
+                None
+            }
+        };
+
+        Ok(Self { norm1, attn, norm2, ff, skip_in_linear })
     }
 
-    fn forward(&self, x: &Tensor, cond: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, cond: &Tensor, _skip: Option<&Tensor>) -> Result<Tensor> {
+        // skip_in_linear usage is deferred to a later phase
+        // For now, just keep the existing forward logic unchanged
+
         // Self-attention with AdaLN
         let residual = x.clone();
         let x_normed = self.norm1.forward(x, cond)?;
@@ -1616,7 +1644,7 @@ impl DiffusionTransformer {
         let mut block_rms = Vec::new();
 
         for (i, block) in self.blocks.iter().take(mid_point).enumerate() {
-            h = block.forward(&h, &ada_cond)?;
+            h = block.forward(&h, &ada_cond, None)?;
             if should_print {
                 let h_rms: f32 = h.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt();
                 block_rms.push((format!("enc{}", i), h_rms));
@@ -1635,7 +1663,7 @@ impl DiffusionTransformer {
                     h = (h + &skip_features[skip_idx])?;
                 }
             }
-            h = block.forward(&h, &ada_cond)?;
+            h = block.forward(&h, &ada_cond, None)?;
             if should_print {
                 let h_rms: f32 = h.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt();
                 block_rms.push((format!("dec{}", i), h_rms));
