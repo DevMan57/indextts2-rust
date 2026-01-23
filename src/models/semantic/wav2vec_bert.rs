@@ -1128,4 +1128,69 @@ mod tests {
 
         assert_eq!(output.dims3().unwrap(), (1, 100, HIDDEN_SIZE));
     }
+
+    #[test]
+    fn test_var_to_std_conversion() {
+        // Test that variance values are correctly converted to std via sqrt()
+        let device = Device::Cpu;
+        let var = Tensor::new(&[4.0f32, 9.0, 16.0, 25.0], &device).unwrap();
+        let std = var.sqrt().unwrap();
+        let std_vals: Vec<f32> = std.to_vec1().unwrap();
+
+        // sqrt(4) = 2, sqrt(9) = 3, sqrt(16) = 4, sqrt(25) = 5
+        assert!((std_vals[0] - 2.0).abs() < 1e-5, "sqrt(4) should be 2, got {}", std_vals[0]);
+        assert!((std_vals[1] - 3.0).abs() < 1e-5, "sqrt(9) should be 3, got {}", std_vals[1]);
+        assert!((std_vals[2] - 4.0).abs() < 1e-5, "sqrt(16) should be 4, got {}", std_vals[2]);
+        assert!((std_vals[3] - 5.0).abs() < 1e-5, "sqrt(25) should be 5, got {}", std_vals[3]);
+    }
+
+    #[test]
+    fn test_relative_position_indices() {
+        // Test that relative position indices are computed correctly
+        let device = Device::Cpu;
+        let seq_len = 10i64;
+
+        // Create position indices
+        let pos_l = Tensor::arange(0i64, seq_len, &device).unwrap()
+            .reshape((seq_len as usize, 1)).unwrap();
+        let pos_r = Tensor::arange(0i64, seq_len, &device).unwrap()
+            .reshape((1, seq_len as usize)).unwrap();
+
+        // Compute relative distance: key_pos - query_pos
+        let distance = pos_r.broadcast_sub(&pos_l).unwrap();
+        let (q, k) = distance.dims2().unwrap();
+
+        assert_eq!(q, 10, "Query dimension should be 10");
+        assert_eq!(k, 10, "Key dimension should be 10");
+
+        // Check diagonal (should be 0 - same position)
+        let dist_vals: Vec<Vec<i64>> = distance.to_vec2().unwrap();
+        assert_eq!(dist_vals[0][0], 0, "Distance at (0,0) should be 0");
+        assert_eq!(dist_vals[5][5], 0, "Distance at (5,5) should be 0");
+
+        // Check off-diagonal (positive = key is ahead of query)
+        assert_eq!(dist_vals[0][5], 5, "Distance at (0,5) should be 5");
+        assert_eq!(dist_vals[5][0], -5, "Distance at (5,0) should be -5");
+    }
+
+    #[test]
+    fn test_relative_position_clamping() {
+        // Test that distances are clamped to valid range [-64, 8]
+        let device = Device::Cpu;
+
+        // Create a tensor with values outside the valid range
+        let distance = Tensor::new(&[-100i64, -64, -50, 0, 5, 8, 100], &device).unwrap();
+
+        // Clamp to [-64, 8]
+        let clamped = distance.clamp(-LEFT_MAX_POS, RIGHT_MAX_POS).unwrap();
+        let clamped_vals: Vec<i64> = clamped.to_vec1().unwrap();
+
+        assert_eq!(clamped_vals[0], -64, "-100 should clamp to -64");
+        assert_eq!(clamped_vals[1], -64, "-64 should stay -64");
+        assert_eq!(clamped_vals[2], -50, "-50 should stay -50");
+        assert_eq!(clamped_vals[3], 0, "0 should stay 0");
+        assert_eq!(clamped_vals[4], 5, "5 should stay 5");
+        assert_eq!(clamped_vals[5], 8, "8 should stay 8");
+        assert_eq!(clamped_vals[6], 8, "100 should clamp to 8");
+    }
 }
