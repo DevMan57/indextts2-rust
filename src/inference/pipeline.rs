@@ -217,12 +217,14 @@ impl IndexTTS2 {
                 let tensors = diagnostics.load_safetensors(&w2v_path, "Wav2Vec-BERT", &self.device)?;
                 let available_keys: Vec<String> = tensors.keys().cloned().collect();
 
-                // Expected key patterns for Wav2Vec-BERT
+                // Expected key patterns for Wav2Vec-BERT (actual naming from HuggingFace model)
                 let expected_keys: HashSet<String> = [
-                    "encoder.layers.0.self_attn.k_proj.weight",
-                    "encoder.layers.0.self_attn.v_proj.weight",
-                    "encoder.layers.0.self_attn.q_proj.weight",
-                    "encoder.layers.0.self_attn.out_proj.weight",
+                    "encoder.layers.0.self_attn.linear_k.weight",
+                    "encoder.layers.0.self_attn.linear_v.weight",
+                    "encoder.layers.0.self_attn.linear_q.weight",
+                    "encoder.layers.0.self_attn.linear_out.weight",
+                    "encoder.layers.0.conv_module.pointwise_conv1.weight",
+                    "encoder.layers.0.conv_module.pointwise_conv2.weight",
                     "feature_projection.projection.weight",
                     "feature_projection.projection.bias",
                 ].iter().map(|s| s.to_string()).collect();
@@ -246,15 +248,16 @@ impl IndexTTS2 {
             let tensors = diagnostics.load_safetensors(&gpt_path, "GPT", &self.device)?;
             let available_keys: Vec<String> = tensors.keys().cloned().collect();
 
-            // Expected key patterns for GPT (UnifiedVoice)
+            // Expected key patterns for GPT (actual naming from IndexTTS checkpoint)
             let expected_keys: HashSet<String> = [
                 "text_embedding.weight",
                 "mel_embedding.weight",
-                "text_pos_embedding.weight",
-                "mel_pos_embedding.weight",
                 "final_norm.weight",
                 "mel_head.weight",
-                "transformer.layers.0.attn.qkv.weight",
+                "gpt.h.0.attn.c_attn.weight",
+                "gpt.h.0.attn.c_proj.weight",
+                "gpt.h.0.mlp.c_fc.weight",
+                "conditioning_encoder.encoders.0.self_attn.linear_k.weight",
             ].iter().map(|s| s.to_string()).collect();
 
             diagnostics.record_component(
@@ -278,14 +281,14 @@ impl IndexTTS2 {
             let tensors = diagnostics.load_safetensors(&s2mel_path, "DiT", &self.device)?;
             let available_keys: Vec<String> = tensors.keys().cloned().collect();
 
-            // Expected key patterns for DiT (Diffusion Transformer)
+            // Expected key patterns for DiT (actual naming from IndexTTS s2mel checkpoint)
             let expected_keys: HashSet<String> = [
-                "blocks.0.attn.qkv.weight",
-                "blocks.0.attn.proj.weight",
-                "x_embedder.weight",
-                "t_embedder.mlp.0.weight",
-                "t_embedder.mlp.2.weight",
-                "final_layer.linear.weight",
+                "cfm.estimator.transformer.layers.0.feed_forward.w1.weight",
+                "cfm.estimator.transformer.layers.0.feed_forward.w2.weight",
+                "cfm.estimator.transformer.layers.0.attention.wq.weight",
+                "cfm.estimator.x_embedder.weight_v",
+                "cfm.estimator.t_embedder.mlp.0.weight",
+                "length_regulator.model.0.weight",
             ].iter().map(|s| s.to_string()).collect();
 
             diagnostics.record_component(
@@ -316,14 +319,15 @@ impl IndexTTS2 {
                 let tensors = diagnostics.load_safetensors(&vocoder_path, "BigVGAN", &self.device)?;
                 let available_keys: Vec<String> = tensors.keys().cloned().collect();
 
-                // Expected key patterns for BigVGAN
+                // Expected key patterns for BigVGAN (actual naming from NVIDIA checkpoint)
                 let expected_keys: HashSet<String> = [
                     "conv_pre.weight",
                     "conv_pre.bias",
                     "ups.0.weight",
                     "ups.0.bias",
                     "resblocks.0.convs1.0.weight",
-                    "resblocks.0.convs2.0.weight",
+                    "resblocks.0.convs1.0.bias",
+                    "resblocks.0.activations.0.act.alpha",
                     "conv_post.weight",
                 ].iter().map(|s| s.to_string()).collect();
 
