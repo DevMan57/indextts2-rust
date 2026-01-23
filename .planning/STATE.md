@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-01-23)
 
 **Core value:** Generate intelligible, natural-sounding speech from text input using a speaker reference audio for voice cloning.
-**Current focus:** Phase 3 - GPT Components (COMPLETE)
+**Current focus:** Phase 4 - DiT Weights (COMPLETE)
 
 ## Current Position
 
-Phase: 3 of 8 (GPT Components)
-Plan: 2 of 2 in current phase (Complete)
-Status: Phase 3 COMPLETE
-Last activity: 2026-01-23 - Completed 03-02-PLAN.md
+Phase: 4 of 8 (DiT Weights)
+Plan: 1 of 1 in current phase (Complete)
+Status: Phase 4 COMPLETE
+Last activity: 2026-01-23 - Completed 04-01-PLAN.md
 
-Progress: [######----] 62%
+Progress: [#######---] 70%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 6
-- Average duration: ~11 minutes
-- Total execution time: 1.1 hours
+- Total plans completed: 7
+- Average duration: ~10 minutes
+- Total execution time: 1.2 hours
 
 **By Phase:**
 
@@ -30,10 +30,11 @@ Progress: [######----] 62%
 | 01-Diagnostic | 2 | 28 min | 14 min |
 | 02-Wav2Vec-BERT | 2 | 20 min | 10 min |
 | 03-GPT Components | 2 | 18 min | 9 min |
+| 04-DiT Weights | 1 | 9 min | 9 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-02 (13 min), 02-01 (10 min), 02-02 (10 min), 03-01 (10 min), 03-02 (8 min)
-- Trend: Consistent pace, improving to ~9 min/plan
+- Last 5 plans: 02-01 (10 min), 02-02 (10 min), 03-01 (10 min), 03-02 (8 min), 04-01 (9 min)
+- Trend: Consistent pace at ~9 min/plan
 
 *Updated after each plan completion*
 
@@ -55,6 +56,7 @@ Recent decisions affecting current work:
 - [03-02]: SwiGLU dimensions [3412, 1280] -> [1280, 1706] match checkpoint exactly
 - [03-02]: proj_context projects Conformer 512-dim to Perceiver 1280-dim latent space
 - [03-02]: Final norm uses gamma only (beta set to zeros)
+- [04-01]: skip_in_linear loaded but forward usage deferred to future phase
 
 ### Pending Todos
 
@@ -65,9 +67,10 @@ None yet.
 - ~~Silent fallback to random weights masks loading failures~~ (RESOLVED: Phase 1 complete)
 - ~~No visibility into tensor names during weight loading~~ (RESOLVED: 01-02 complete)
 - ~~Tensor name mismatches between HuggingFace models and Rust loaders~~ (RESOLVED: 02-01, 02-02 complete)
+- GPT perceiver shape mismatch in matmul (lhs: [1, 126, 1280], rhs: [1, 512, 1280]) - blocks full inference
 
 ## Session Continuity
 
 Last session: 2026-01-23
-Stopped at: Completed 03-02-PLAN.md
+Stopped at: Completed 04-01-PLAN.md
 Resume file: None
