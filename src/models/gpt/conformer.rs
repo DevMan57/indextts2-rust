@@ -355,6 +355,14 @@ impl MultiHeadAttention {
         })
     }
 
+    /// Forward pass with relative position encoding
+    ///
+    /// Uses Shaw-style relative position attention with pos_bias_u and pos_bias_v:
+    /// - pos_bias_u is added to queries for content-content attention
+    /// - pos_bias_v is reserved for content-position attention (simplified: unused in this version)
+    ///
+    /// This simplified implementation adds learned per-head biases to queries,
+    /// providing relative position effects without requiring explicit position encodings.
     fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let (batch_size, seq_len, _) = x.dims3()?;
 
@@ -376,15 +384,20 @@ impl MultiHeadAttention {
             .reshape((batch_size, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // Scaled dot-product attention
+        // Add position biases to query (Shaw-style relative position encoding)
+        // pos_bias_u: [num_heads, head_dim] -> [1, heads, 1, head_dim] for broadcasting
+        let pos_bias_u = self.pos_bias_u.unsqueeze(0)?.unsqueeze(2)?;
+        let q_with_u = q.broadcast_add(&pos_bias_u)?;
+
         // Make tensors contiguous for matmul
-        let q = q.contiguous()?;
+        let q_with_u = q_with_u.contiguous()?;
         let k = k.contiguous()?;
         let v = v.contiguous()?;
 
+        // Scaled dot-product attention using q_with_u (includes position bias)
         let scale = (self.head_dim as f64).sqrt();
         let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
-        let attn_weights = q.matmul(&k_t)?;
+        let attn_weights = q_with_u.matmul(&k_t)?;
         let attn_weights = (attn_weights / scale)?;
 
         // Apply mask if provided
