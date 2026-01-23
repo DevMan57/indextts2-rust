@@ -1025,4 +1025,38 @@ mod tests {
         // swish(-1) ≈ -0.27, swish(0) = 0, swish(1) ≈ 0.73, swish(2) ≈ 1.76
         assert_eq!(out.dims1().unwrap(), 4);
     }
+
+    #[test]
+    fn test_conformer_pos_bias_shapes() {
+        let device = Device::Cpu;
+        let mut encoder = ConformerEncoder::new(&device).unwrap();
+        encoder.initialize_random().unwrap();
+        // Check shapes through forward pass with specific input
+        let x = Tensor::randn(0.0f32, 1.0, (1, 10, 80), &device).unwrap();
+        let out = encoder.forward(&x, None).unwrap();
+        assert_eq!(out.dims3().unwrap(), (1, 10, 512));
+    }
+
+    #[test]
+    fn test_multihead_attention_with_pos_bias() {
+        let device = Device::Cpu;
+        let attn = MultiHeadAttention::new_random(512, 8, &device).unwrap();
+        let x = Tensor::randn(0.0f32, 1.0, (2, 50, 512), &device).unwrap();
+        let out = attn.forward(&x, None).unwrap();
+        assert_eq!(out.dims3().unwrap(), (2, 50, 512));
+    }
+
+    #[test]
+    fn test_pos_bias_fields_initialized() {
+        let device = Device::Cpu;
+        let attn = MultiHeadAttention::new_random(512, 8, &device).unwrap();
+        // Verify pos_bias_u and pos_bias_v have correct shapes
+        let (num_heads, head_dim) = attn.pos_bias_u.dims2().unwrap();
+        assert_eq!(num_heads, 8);
+        assert_eq!(head_dim, 64);
+
+        let (num_heads_v, head_dim_v) = attn.pos_bias_v.dims2().unwrap();
+        assert_eq!(num_heads_v, 8);
+        assert_eq!(head_dim_v, 64);
+    }
 }
