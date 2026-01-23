@@ -333,11 +333,11 @@ impl UnifiedVoice {
             &self.device,
         )?);
 
-        // Conformer encoder
+        // Conformer encoder - outputs 512 dim, Perceiver proj_context handles 512->1280
         let mut conformer = ConformerEncoder::with_config(
             ConformerConfig {
                 input_dim: 80,
-                output_dim: dim,
+                output_dim: 512,  // Conformer internal dim is 512, NOT model_dim (1280)
                 num_blocks: 6,
                 num_heads: 8,
                 ff_expansion: 4,
@@ -470,12 +470,11 @@ impl UnifiedVoice {
     /// Load conformer encoder weights
     #[allow(unused_variables)]
     fn load_conformer_weights(&mut self, tensors: &HashMap<String, Tensor>) -> Result<()> {
-        // Initialize conformer with random weights for now
-        // Full implementation would extract conditioning_encoder.* weights
+        // Initialize conformer - outputs 512 dim, Perceiver proj_context handles 512->1280
         let mut conformer = ConformerEncoder::with_config(
             ConformerConfig {
                 input_dim: 80,
-                output_dim: self.config.model_dim,
+                output_dim: 512,  // Conformer internal dim is 512, NOT model_dim (1280)
                 num_blocks: 6,
                 num_heads: 8,
                 ff_expansion: 4,
@@ -501,7 +500,7 @@ impl UnifiedVoice {
                 dim: self.config.model_dim,
                 context_dim: 512,
                 num_latents: 32,
-                num_heads: 20,  // Match GPT's 20 heads
+                num_heads: 8,  // 512 attn_dim / 8 heads = 64 head_dim
                 num_layers: 2,
                 ff_mult: 4,
                 attn_dim: 512,
@@ -573,10 +572,10 @@ impl UnifiedVoice {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Perceiver not initialized"))?;
 
-        // Conformer encodes the mel features
+        // Conformer encodes the mel features (outputs 512 dim)
         let encoded = conformer.forward(mel_features, None)?;
 
-        // Perceiver resamples to fixed length conditioning
+        // Perceiver resamples to fixed length conditioning (proj_context: 512->1280)
         perceiver.forward(&encoded)
     }
 
