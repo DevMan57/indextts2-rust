@@ -75,10 +75,10 @@ Plans:
   2. Weight normalization applied correctly to x_embedder
   3. Fused QKV tensors split correctly for transformer attention
   4. No "using random weights" warnings appear for DiT
-**Plans**: TBD
+**Plans:** 1 plan
 
 Plans:
-- [ ] 04-01: Fix DiT tensor name mapping and weight transformations
+- [ ] 04-01-PLAN.md — Add skip_in_linear to DiTBlock and verify all weights load
 
 ### Phase 5: CUDA Foundation
 **Goal**: User can run inference on CUDA device instead of CPU
@@ -147,7 +147,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8
 | 1. Diagnostic Infrastructure | 2/2 | Verified | 2026-01-23 |
 | 2. Wav2Vec-BERT Weights | 2/2 | Verified | 2026-01-23 |
 | 3. GPT Components | 2/2 | Verified | 2026-01-23 |
-| 4. DiT Weights | 0/1 | Not started | - |
+| 4. DiT Weights | 0/1 | Planned | - |
 | 5. CUDA Foundation | 0/1 | Not started | - |
 | 6. CUDA Optimization | 0/1 | Not started | - |
 | 7. Weight Validation | 0/1 | Not started | - |
