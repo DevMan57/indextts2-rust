@@ -14,7 +14,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Diagnostic Infrastructure** - Add strict validation to expose weight loading failures
 - [x] **Phase 2: Wav2Vec-BERT Weights** - Fix semantic encoder weight loading
-- [ ] **Phase 3: GPT Components** - Fix Conformer and Perceiver weight loading
+- [x] **Phase 3: GPT Components** - Fix Conformer and Perceiver weight loading
 - [ ] **Phase 4: DiT Weights** - Fix flow matching model weight loading
 - [ ] **Phase 5: CUDA Foundation** - Enable GPU device selection and basic CUDA inference
 - [ ] **Phase 6: CUDA Optimization** - Enable cuDNN acceleration for convolutions
@@ -63,8 +63,8 @@ Plans:
 **Plans:** 2 plans
 
 Plans:
-- [ ] 03-01-PLAN.md — Add relative position encoding to Conformer attention (linear_pos, pos_bias_u, pos_bias_v)
-- [ ] 03-02-PLAN.md — Fix Perceiver architecture (SwiGLU FFN, proj_context, asymmetric dims, gamma-only norm)
+- [x] 03-01-PLAN.md — Add relative position encoding to Conformer attention (linear_pos, pos_bias_u, pos_bias_v)
+- [x] 03-02-PLAN.md — Fix Perceiver architecture (SwiGLU FFN, proj_context, asymmetric dims, gamma-only norm)
 
 ### Phase 4: DiT Weights
 **Goal**: Flow matching model loads pre-trained weights and produces quality mel spectrograms
@@ -146,7 +146,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8
 |-------|----------------|--------|-----------|
 | 1. Diagnostic Infrastructure | 2/2 | Verified | 2026-01-23 |
 | 2. Wav2Vec-BERT Weights | 2/2 | Verified | 2026-01-23 |
-| 3. GPT Components | 0/2 | Planned | - |
+| 3. GPT Components | 2/2 | Verified | 2026-01-23 |
 | 4. DiT Weights | 0/1 | Not started | - |
 | 5. CUDA Foundation | 0/1 | Not started | - |
 | 6. CUDA Optimization | 0/1 | Not started | - |
