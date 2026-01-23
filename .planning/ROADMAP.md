@@ -45,10 +45,11 @@ Plans:
   1. Wav2Vec-BERT loads all 24 encoder layers from wav2vec2_bert_2.safetensors
   2. No "using random weights" warnings appear for Wav2Vec-BERT
   3. Encoder output statistics (mean/std) differ from random initialization
-**Plans**: TBD
+**Plans:** 2 plans
 
 Plans:
-- [ ] 02-01: Map HuggingFace tensor names to Rust loader expectations
+- [ ] 02-01-PLAN.md — Implement ConvModule and FeatureProjection structs
+- [ ] 02-02-PLAN.md — Fix stats var->std conversion and add distance_embedding
 
 ### Phase 3: GPT Components
 **Goal**: Conformer encoder and Perceiver resampler load pre-trained weights from gpt.safetensors
@@ -143,8 +144,8 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Diagnostic Infrastructure | 2/2 | Verified ✓ | 2026-01-23 |
-| 2. Wav2Vec-BERT Weights | 0/1 | Not started | - |
+| 1. Diagnostic Infrastructure | 2/2 | Verified | 2026-01-23 |
+| 2. Wav2Vec-BERT Weights | 0/2 | Planned | - |
 | 3. GPT Components | 0/2 | Not started | - |
 | 4. DiT Weights | 0/1 | Not started | - |
 | 5. CUDA Foundation | 0/1 | Not started | - |
