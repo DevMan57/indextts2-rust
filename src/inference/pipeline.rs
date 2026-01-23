@@ -9,9 +9,11 @@
 
 use anyhow::{Result, Context};
 use candle_core::{Device, Tensor, DType, D};
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::config::ModelConfig;
+use crate::debug::WeightDiagnostics;
 use crate::text::{TextNormalizer, TextTokenizer};
 use crate::audio::{AudioLoader, Resampler, MelSpectrogram, AudioOutput};
 use crate::models::semantic::{SemanticEncoder, SemanticCodec};
@@ -203,12 +205,35 @@ impl IndexTTS2 {
     /// Initialize all model weights
     pub fn load_weights<P: AsRef<Path>>(&mut self, model_dir: P) -> Result<()> {
         let model_dir = model_dir.as_ref();
+        let mut diagnostics = WeightDiagnostics::new(self.inference_config.verbose_weights);
 
         // Load Wav2Vec-BERT full model if available
         if let Some(ref w2v_model) = self.config.w2v_model {
             let w2v_path = model_dir.join(w2v_model);
             if w2v_path.exists() {
                 tracing::info!("Loading Wav2Vec-BERT model from {:?}...", w2v_path);
+
+                // Enumerate tensors for diagnostics
+                let tensors = diagnostics.load_safetensors(&w2v_path, "Wav2Vec-BERT", &self.device)?;
+                let available_keys: Vec<String> = tensors.keys().cloned().collect();
+
+                // Expected key patterns for Wav2Vec-BERT
+                let expected_keys: HashSet<String> = [
+                    "encoder.layers.0.self_attn.k_proj.weight",
+                    "encoder.layers.0.self_attn.v_proj.weight",
+                    "encoder.layers.0.self_attn.q_proj.weight",
+                    "encoder.layers.0.self_attn.out_proj.weight",
+                    "feature_projection.projection.weight",
+                    "feature_projection.projection.bias",
+                ].iter().map(|s| s.to_string()).collect();
+
+                diagnostics.record_component(
+                    "Wav2Vec-BERT",
+                    &w2v_path.to_string_lossy(),
+                    available_keys,
+                    expected_keys,
+                );
+
                 self.semantic_encoder.load_weights(&w2v_path)
                     .with_context(|| format!("Failed to load Wav2Vec-BERT from {:?}", w2v_path))?;
             }
@@ -217,6 +242,28 @@ impl IndexTTS2 {
         // Load GPT
         let gpt_path = model_dir.join(&self.config.gpt_checkpoint);
         if gpt_path.exists() {
+            // Enumerate tensors for diagnostics
+            let tensors = diagnostics.load_safetensors(&gpt_path, "GPT", &self.device)?;
+            let available_keys: Vec<String> = tensors.keys().cloned().collect();
+
+            // Expected key patterns for GPT (UnifiedVoice)
+            let expected_keys: HashSet<String> = [
+                "text_embedding.weight",
+                "mel_embedding.weight",
+                "text_pos_embedding.weight",
+                "mel_pos_embedding.weight",
+                "final_norm.weight",
+                "mel_head.weight",
+                "transformer.layers.0.attn.qkv.weight",
+            ].iter().map(|s| s.to_string()).collect();
+
+            diagnostics.record_component(
+                "GPT",
+                &gpt_path.to_string_lossy(),
+                available_keys,
+                expected_keys,
+            );
+
             self.gpt.load_weights(&gpt_path)
                 .with_context(|| format!("Failed to load GPT weights from {:?}", gpt_path))?;
         } else {
@@ -227,6 +274,27 @@ impl IndexTTS2 {
         // Load S2Mel (DiT)
         let s2mel_path = model_dir.join(&self.config.s2mel_checkpoint);
         if s2mel_path.exists() {
+            // Enumerate tensors for diagnostics
+            let tensors = diagnostics.load_safetensors(&s2mel_path, "DiT", &self.device)?;
+            let available_keys: Vec<String> = tensors.keys().cloned().collect();
+
+            // Expected key patterns for DiT (Diffusion Transformer)
+            let expected_keys: HashSet<String> = [
+                "blocks.0.attn.qkv.weight",
+                "blocks.0.attn.proj.weight",
+                "x_embedder.weight",
+                "t_embedder.mlp.0.weight",
+                "t_embedder.mlp.2.weight",
+                "final_layer.linear.weight",
+            ].iter().map(|s| s.to_string()).collect();
+
+            diagnostics.record_component(
+                "DiT",
+                &s2mel_path.to_string_lossy(),
+                available_keys,
+                expected_keys,
+            );
+
             self.dit.load_weights(&s2mel_path)
                 .with_context(|| format!("Failed to load DiT weights from {:?}", s2mel_path))?;
             self.length_regulator.load_weights(&s2mel_path)
@@ -243,6 +311,29 @@ impl IndexTTS2 {
             let vocoder_path = model_dir.join(bigvgan_path);
             if vocoder_path.exists() {
                 tracing::info!("Loading BigVGAN from {:?}...", vocoder_path);
+
+                // Enumerate tensors for diagnostics
+                let tensors = diagnostics.load_safetensors(&vocoder_path, "BigVGAN", &self.device)?;
+                let available_keys: Vec<String> = tensors.keys().cloned().collect();
+
+                // Expected key patterns for BigVGAN
+                let expected_keys: HashSet<String> = [
+                    "conv_pre.weight",
+                    "conv_pre.bias",
+                    "ups.0.weight",
+                    "ups.0.bias",
+                    "resblocks.0.convs1.0.weight",
+                    "resblocks.0.convs2.0.weight",
+                    "conv_post.weight",
+                ].iter().map(|s| s.to_string()).collect();
+
+                diagnostics.record_component(
+                    "BigVGAN",
+                    &vocoder_path.to_string_lossy(),
+                    available_keys,
+                    expected_keys,
+                );
+
                 self.vocoder.load_weights(&vocoder_path)
                     .with_context(|| format!("Failed to load BigVGAN weights from {:?}", vocoder_path))?;
             } else {
@@ -268,6 +359,9 @@ impl IndexTTS2 {
                     .with_context(|| format!("Failed to load emotion matrix from {:?}", emo_path))?;
             }
         }
+
+        // Print final weight loading summary
+        diagnostics.print_final_summary();
 
         Ok(())
     }

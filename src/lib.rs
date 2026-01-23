@@ -20,8 +20,11 @@
 //! audio.save("output.wav")?;
 //! ```
 
+// Allow dead code for infrastructure that may be used in the future
+#![allow(dead_code)]
+// Require docs for public items, but not struct fields (too verbose)
 #![warn(missing_docs)]
-#![warn(rustdoc::missing_crate_level_docs)]
+#![allow(rustdoc::missing_crate_level_docs)]
 
 pub mod audio;
 pub mod config;
@@ -34,6 +37,7 @@ pub mod utils;
 // Re-exports for convenience
 pub use config::ModelConfig;
 pub use inference::IndexTTS2;
+pub use debug::{WeightDiagnostics, ComponentReport};
 
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
