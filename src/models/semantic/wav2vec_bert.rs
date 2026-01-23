@@ -33,6 +33,14 @@ const EXTRACT_LAYER: usize = 17;
 const INPUT_FEATURE_DIM: usize = 160;
 /// Conv module kernel size
 const CONV_KERNEL_SIZE: usize = 31;
+/// Head dimension (for distance embedding)
+const HEAD_DIM: usize = 64;
+/// Relative position encoding: left context window
+const LEFT_MAX_POS: i64 = 64;
+/// Relative position encoding: right context window
+const RIGHT_MAX_POS: i64 = 8;
+/// Total positions: left + right + 1 (for position 0)
+const NUM_POSITIONS: usize = 73; // 64 + 8 + 1
 
 /// Helper to load a Linear layer from tensors
 /// candle_nn::Linear expects weights in PyTorch format [out_features, in_features]
@@ -336,7 +344,12 @@ impl FeatureProjection {
     }
 }
 
-/// Self-attention layer for Wav2Vec-BERT
+/// Self-attention layer for Wav2Vec-BERT with Shaw-style relative position encoding
+///
+/// The distance_embedding provides position-dependent attention bias based on
+/// the relative distance between query and key positions. Shape: [73, 64]
+/// - 73 positions: left context (64) + right context (8) + position 0
+/// - 64: head dimension for computing position bias
 struct SelfAttention {
     query: Linear,
     key: Linear,
@@ -344,6 +357,8 @@ struct SelfAttention {
     output: Linear,
     num_heads: usize,
     head_dim: usize,
+    /// Distance embedding for Shaw-style relative position encoding [73, 64]
+    distance_embedding: Option<Tensor>,
 }
 
 impl SelfAttention {
@@ -380,6 +395,28 @@ impl SelfAttention {
             Some(&format!("{}.linear_out.bias", prefix)),
         )?;
 
+        // Load distance embedding for relative position encoding [73, 64]
+        let distance_key = format!("{}.distance_embedding.weight", prefix);
+        let distance_embedding = match tensors.get(&distance_key) {
+            Some(de) => {
+                let (num_pos, dim) = de.dims2()?;
+                if num_pos != NUM_POSITIONS || dim != HEAD_DIM {
+                    tracing::warn!(
+                        "[Wav2Vec-BERT] Unexpected distance_embedding shape [{}, {}], expected [{}, {}]",
+                        num_pos, dim, NUM_POSITIONS, HEAD_DIM
+                    );
+                }
+                Some(de.clone())
+            }
+            None => {
+                tracing::warn!(
+                    "[Wav2Vec-BERT] Missing tensor '{}', skipping relative position bias",
+                    distance_key
+                );
+                None
+            }
+        };
+
         Ok(Self {
             query,
             key,
@@ -387,6 +424,7 @@ impl SelfAttention {
             output,
             num_heads,
             head_dim,
+            distance_embedding,
         })
     }
 
@@ -404,7 +442,84 @@ impl SelfAttention {
             output: make_linear(device)?,
             num_heads,
             head_dim,
+            distance_embedding: None, // No relative position bias for random init
         })
+    }
+
+    /// Compute Shaw-style relative position bias
+    ///
+    /// Given query tensor and distance embedding, computes position-dependent
+    /// attention bias based on relative positions between query and key.
+    ///
+    /// Algorithm:
+    /// 1. Create position indices for query and key
+    /// 2. Compute relative distance: key_pos - query_pos
+    /// 3. Clamp to [-LEFT_MAX_POS, RIGHT_MAX_POS]
+    /// 4. Shift to positive indices: distance + LEFT_MAX_POS
+    /// 5. Lookup distance embeddings
+    /// 6. Compute bias via dot product with query
+    fn compute_relative_position_bias(
+        &self,
+        query: &Tensor,
+        seq_len: usize,
+    ) -> Result<Tensor> {
+        let distance_emb = match &self.distance_embedding {
+            Some(de) => de,
+            None => return Ok(Tensor::zeros(query.shape(), query.dtype(), query.device())?),
+        };
+
+        let device = query.device();
+
+        // Create position indices [0, 1, 2, ..., seq_len-1]
+        let positions = Tensor::arange(0i64, seq_len as i64, device)?;
+
+        // Query positions: [seq_len, 1]
+        let pos_q = positions.reshape((seq_len, 1))?;
+        // Key positions: [1, seq_len]
+        let pos_k = positions.reshape((1, seq_len))?;
+
+        // Relative distance: key_pos - query_pos -> [seq_len, seq_len]
+        let distance = pos_k.broadcast_sub(&pos_q)?;
+
+        // Clamp to valid range [-LEFT_MAX_POS, RIGHT_MAX_POS]
+        let distance = distance.clamp(-LEFT_MAX_POS, RIGHT_MAX_POS)?;
+
+        // Shift to positive indices [0, NUM_POSITIONS-1]
+        let indices = (distance + LEFT_MAX_POS as f64)?;
+        let indices = indices.to_dtype(DType::U32)?;
+
+        // Flatten indices for index_select
+        let flat_indices = indices.flatten_all()?;
+
+        // Lookup embeddings: [seq_len * seq_len, head_dim]
+        let pos_emb = distance_emb.index_select(&flat_indices, 0)?;
+
+        // Reshape to [seq_len, seq_len, head_dim]
+        let pos_emb = pos_emb.reshape((seq_len, seq_len, self.head_dim))?;
+
+        // query shape: [batch, heads, seq_len, head_dim]
+        // We compute: bias[b, h, i, j] = query[b, h, i, :] dot pos_emb[i, j, :]
+        // = sum_d query[b, h, i, d] * pos_emb[i, j, d]
+
+        // Use broadcasting: (query.unsqueeze(-2) * pos_emb.unsqueeze(0).unsqueeze(0)).sum(-1)
+        // query: [batch, heads, seq, 1, head_dim]
+        // pos_emb: [1, 1, seq, seq, head_dim]
+        // product: [batch, heads, seq, seq, head_dim]
+        // sum: [batch, heads, seq, seq]
+
+        let query_expanded = query.unsqueeze(3)?; // [batch, heads, seq, 1, head_dim]
+        let pos_emb_expanded = pos_emb
+            .unsqueeze(0)?
+            .unsqueeze(0)?; // [1, 1, seq, seq, head_dim]
+
+        let bias = query_expanded.broadcast_mul(&pos_emb_expanded)?;
+        let bias = bias.sum(D::Minus1)?; // [batch, heads, seq, seq]
+
+        // Scale by 1/sqrt(head_dim) (already done in main attention, but pos bias should also be scaled)
+        let scale = (self.head_dim as f64).sqrt();
+        let bias = (bias / scale)?;
+
+        Ok(bias)
     }
 
     fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
@@ -436,6 +551,14 @@ impl SelfAttention {
         let key_t = key.transpose(D::Minus2, D::Minus1)?.contiguous()?;
         let attn_weights = query.matmul(&key_t)?;
         let attn_weights = (attn_weights / scale)?;
+
+        // Add relative position bias if distance_embedding is available
+        let attn_weights = if self.distance_embedding.is_some() {
+            let pos_bias = self.compute_relative_position_bias(&query, seq_len)?;
+            (attn_weights + pos_bias)?
+        } else {
+            attn_weights
+        };
 
         // Apply attention mask if provided
         let attn_weights = if let Some(mask) = attention_mask {
