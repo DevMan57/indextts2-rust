@@ -268,6 +268,74 @@ impl ConvModule {
     }
 }
 
+/// FeatureProjection for Wav2Vec-BERT 2.0
+///
+/// Projects 160-dim input features from the CNN feature extractor to 1024-dim hidden states.
+/// Structure:
+/// - layer_norm: LayerNorm [160]
+/// - projection: Linear [1024, 160] + bias [1024]
+struct FeatureProjection {
+    layer_norm: LayerNorm,
+    projection: Linear,
+}
+
+impl FeatureProjection {
+    /// Load from HuggingFace checkpoint tensors
+    /// Tensor names:
+    /// - feature_projection.layer_norm.weight [160]
+    /// - feature_projection.layer_norm.bias [160]
+    /// - feature_projection.projection.weight [1024, 160]
+    /// - feature_projection.projection.bias [1024]
+    fn from_tensors(
+        tensors: &HashMap<String, Tensor>,
+        input_dim: usize,
+        _hidden_dim: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let layer_norm = load_layer_norm(
+            tensors,
+            "feature_projection.layer_norm.weight",
+            "feature_projection.layer_norm.bias",
+            input_dim,
+            device,
+        )?;
+
+        let projection = load_linear(
+            tensors,
+            "feature_projection.projection.weight",
+            Some("feature_projection.projection.bias"),
+        )?;
+
+        Ok(Self {
+            layer_norm,
+            projection,
+        })
+    }
+
+    /// Initialize with random weights (fallback)
+    fn new_random(input_dim: usize, hidden_dim: usize, device: &Device) -> Result<Self> {
+        let ln_weight = Tensor::ones((input_dim,), DType::F32, device)?;
+        let ln_bias = Tensor::zeros((input_dim,), DType::F32, device)?;
+        let layer_norm = LayerNorm::new(ln_weight, ln_bias, 1e-5);
+
+        let proj_weight = Tensor::randn(0.0f32, 0.02, (hidden_dim, input_dim), device)?;
+        let proj_bias = Tensor::zeros((hidden_dim,), DType::F32, device)?;
+        let projection = Linear::new(proj_weight, Some(proj_bias));
+
+        Ok(Self {
+            layer_norm,
+            projection,
+        })
+    }
+
+    /// Forward pass: LayerNorm -> Linear
+    /// Input: (batch, seq, input_dim) -> Output: (batch, seq, hidden_dim)
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = self.layer_norm.forward(x)?;
+        self.projection.forward(&x).map_err(Into::into)
+    }
+}
+
 /// Self-attention layer for Wav2Vec-BERT
 struct SelfAttention {
     query: Linear,
@@ -446,7 +514,7 @@ impl FeedForward {
 /// - ffn1_layer_norm
 /// - self_attn (attention)
 /// - self_attn_layer_norm
-/// - conv_module (optional convolution)
+/// - conv_module (convolution module)
 /// - ffn2 (second feed-forward)
 /// - ffn2_layer_norm
 /// - final_layer_norm
@@ -455,6 +523,7 @@ struct EncoderLayer {
     ffn1_layer_norm: LayerNorm,
     attention: SelfAttention,
     attention_layer_norm: LayerNorm,
+    conv_module: Option<ConvModule>,
     ffn2: FeedForward,
     ffn2_layer_norm: LayerNorm,
     final_layer_norm: LayerNorm,
@@ -502,6 +571,24 @@ impl EncoderLayer {
             device,
         )?;
 
+        // Conv module - load from checkpoint
+        let conv_module = match ConvModule::from_tensors(
+            tensors,
+            &format!("{}.conv_module", prefix),
+            hidden_size,
+            CONV_KERNEL_SIZE,
+            device,
+        ) {
+            Ok(cm) => Some(cm),
+            Err(e) => {
+                tracing::warn!(
+                    "[Wav2Vec-BERT] Layer {} conv_module load failed: {}, skipping",
+                    layer_idx, e
+                );
+                None
+            }
+        };
+
         // FFN2
         let ffn2 = FeedForward::from_tensors(
             tensors,
@@ -531,6 +618,7 @@ impl EncoderLayer {
             ffn1_layer_norm,
             attention,
             attention_layer_norm,
+            conv_module,
             ffn2,
             ffn2_layer_norm,
             final_layer_norm,
@@ -554,6 +642,7 @@ impl EncoderLayer {
             ffn1_layer_norm: make_ln()?,
             attention: SelfAttention::new_random(hidden_size, num_heads, device)?,
             attention_layer_norm: make_ln()?,
+            conv_module: Some(ConvModule::new_random(hidden_size, CONV_KERNEL_SIZE, device)?),
             ffn2: FeedForward::new_random(hidden_size, intermediate_size, device)?,
             ffn2_layer_norm: make_ln()?,
             final_layer_norm: make_ln()?,
@@ -574,13 +663,22 @@ impl EncoderLayer {
         let attn_output = self.attention.forward(&normed, attention_mask)?;
         let hidden_states = (residual + attn_output)?;
 
-        // 3. Half-step FFN2 with residual
+        // 3. Conv module with residual (if present)
+        let hidden_states = if let Some(ref conv) = self.conv_module {
+            let residual = hidden_states.clone();
+            let conv_output = conv.forward(&hidden_states)?;
+            (residual + conv_output)?
+        } else {
+            hidden_states
+        };
+
+        // 4. Half-step FFN2 with residual
         let residual = hidden_states.clone();
         let hidden_states = self.ffn2_layer_norm.forward(&hidden_states)?;
         let hidden_states = self.ffn2.forward(&hidden_states)?;
         let hidden_states = (residual + (hidden_states * 0.5)?)?;
 
-        // 4. Final layer norm
+        // 5. Final layer norm
         self.final_layer_norm.forward(&hidden_states).map_err(Into::into)
     }
 }
@@ -592,6 +690,8 @@ pub struct SemanticEncoder {
     /// Normalization statistics (from wav2vec2bert_stats.pt)
     mean: Tensor,
     std: Tensor,
+    /// Feature projection (160-dim -> 1024-dim)
+    feature_projection: Option<FeatureProjection>,
     /// Encoder layers
     encoder_layers: Vec<EncoderLayer>,
     /// Layer to extract features from
@@ -618,6 +718,7 @@ impl SemanticEncoder {
             device: device.clone(),
             mean,
             std,
+            feature_projection: None,
             encoder_layers,
             extract_layer: EXTRACT_LAYER,
             weights_loaded: false,
@@ -659,6 +760,14 @@ impl SemanticEncoder {
 
     /// Initialize with random weights
     pub fn initialize_random(&mut self) -> Result<()> {
+        // Initialize feature projection
+        self.feature_projection = Some(FeatureProjection::new_random(
+            INPUT_FEATURE_DIM,
+            HIDDEN_SIZE,
+            &self.device,
+        )?);
+
+        // Initialize encoder layers
         self.encoder_layers.clear();
         for _ in 0..NUM_LAYERS {
             self.encoder_layers.push(EncoderLayer::new_random(
@@ -692,6 +801,26 @@ impl SemanticEncoder {
         // Debug: print first few keys to verify structure
         let keys: Vec<_> = tensors.keys().take(5).collect();
         eprintln!("  Sample tensor keys: {:?}", keys);
+
+        // Load feature projection (global, not per-layer)
+        self.feature_projection = match FeatureProjection::from_tensors(
+            &tensors,
+            INPUT_FEATURE_DIM,
+            HIDDEN_SIZE,
+            &self.device,
+        ) {
+            Ok(fp) => {
+                eprintln!("  Loaded feature_projection (160 -> 1024)");
+                Some(fp)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[Wav2Vec-BERT] Failed to load feature_projection: {}, using random",
+                    e
+                );
+                Some(FeatureProjection::new_random(INPUT_FEATURE_DIM, HIDDEN_SIZE, &self.device)?)
+            }
+        };
 
         // Load encoder layers with proper name mapping
         self.encoder_layers.clear();
@@ -765,19 +894,38 @@ impl SemanticEncoder {
                 // Downsample by ~320 (typical Wav2Vec stride) and create placeholder features
                 let seq_len = samples / 320;
                 let seq_len = seq_len.max(1);
-                // Create random placeholder features since we don't have the full CNN
-                Tensor::randn(0.0f32, 1.0, (batch, seq_len, HIDDEN_SIZE), &self.device)?
+                // Create placeholder features at INPUT_FEATURE_DIM (160) for feature_projection
+                Tensor::randn(0.0f32, 1.0, (batch, seq_len, INPUT_FEATURE_DIM), &self.device)?
             }
             3 => input_features.clone(),
             _ => anyhow::bail!("Expected 2D or 3D input, got {}D", input_features.rank()),
         };
 
-        // Ensure input has correct hidden size
+        // Get input dimensions
         let (_batch, _seq, feat_dim) = input_3d.dims3()?;
-        let hidden_states = if feat_dim == HIDDEN_SIZE {
+
+        // Apply feature projection if available and input is at INPUT_FEATURE_DIM
+        let hidden_states = if let Some(ref fp) = self.feature_projection {
+            if feat_dim == INPUT_FEATURE_DIM {
+                // Apply learned feature projection: 160 -> 1024
+                fp.forward(&input_3d)?
+            } else if feat_dim == HIDDEN_SIZE {
+                // Already at hidden size, skip projection
+                input_3d
+            } else {
+                // Dimension mismatch - use random projection as fallback
+                tracing::warn!(
+                    "[Wav2Vec-BERT] Input dim {} doesn't match INPUT_FEATURE_DIM ({}) or HIDDEN_SIZE ({}), using random projection",
+                    feat_dim, INPUT_FEATURE_DIM, HIDDEN_SIZE
+                );
+                let projection = Tensor::randn(0.0f32, 0.02, (feat_dim, HIDDEN_SIZE), &self.device)?;
+                input_3d.matmul(&projection)?
+            }
+        } else if feat_dim == HIDDEN_SIZE {
+            // No feature projection loaded, but input is already at hidden size
             input_3d
         } else {
-            // Simple linear projection if dimensions don't match
+            // No feature projection and dimension mismatch - use random projection
             let projection = Tensor::randn(0.0f32, 0.02, (feat_dim, HIDDEN_SIZE), &self.device)?;
             input_3d.matmul(&projection)?
         };
