@@ -725,7 +725,10 @@ impl SemanticEncoder {
         })
     }
 
-    /// Load stats from PyTorch file
+    /// Load stats from safetensors file
+    ///
+    /// The checkpoint stores variance (var) but we need standard deviation (std).
+    /// This function handles the var -> std conversion via sqrt().
     fn load_stats(path: &Path, device: &Device) -> Result<(Tensor, Tensor)> {
         // Try to load from safetensors format first, then fall back to defaults
         if path.exists() {
@@ -739,13 +742,23 @@ impl SemanticEncoder {
                         Tensor::zeros((HIDDEN_SIZE,), DType::F32, device)?
                     }
                 };
+                // Handle std vs var: checkpoint may store variance, we need std
                 let std = match tensors.get("std") {
                     Some(s) => s.clone(),
-                    None => {
-                        tracing::warn!(
-                            "[Wav2Vec-BERT] Missing tensor 'std' in stats file, using ones initialization"
-                        );
-                        Tensor::ones((HIDDEN_SIZE,), DType::F32, device)?
+                    None => match tensors.get("var") {
+                        Some(var) => {
+                            // Convert variance to standard deviation via sqrt()
+                            tracing::info!(
+                                "[Wav2Vec-BERT] Converting 'var' to 'std' via sqrt()"
+                            );
+                            var.sqrt()?
+                        }
+                        None => {
+                            tracing::warn!(
+                                "[Wav2Vec-BERT] Missing 'std' or 'var' in stats file, using ones initialization"
+                            );
+                            Tensor::ones((HIDDEN_SIZE,), DType::F32, device)?
+                        }
                     }
                 };
                 return Ok((mean, std));
@@ -753,6 +766,10 @@ impl SemanticEncoder {
         }
 
         // Default: zero mean, unit std (no normalization)
+        tracing::warn!(
+            "[Wav2Vec-BERT] Stats file not found at {:?}, using default normalization",
+            path
+        );
         let mean = Tensor::zeros((HIDDEN_SIZE,), DType::F32, device)?;
         let std = Tensor::ones((HIDDEN_SIZE,), DType::F32, device)?;
         Ok((mean, std))
