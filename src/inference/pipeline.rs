@@ -590,33 +590,30 @@ impl IndexTTS2 {
         // NO mel normalization - Python does NOT normalize before flow matching!
         // The mel spectrogram is already in log-compressed form from mel extraction
 
-        // Create prompt_x from reference mel by padding/truncating to match seq_len
-        // speaker_tensor is [B, T, C] = [1, n_frames, 80]
+        // Calculate prompt_len first (Python uses reference mel length as prompt)
+        // Use a portion of the reference mel as the prompt anchor
         let speaker_mel_len = speaker_tensor.dim(1)?;
-        let prompt_x_tc = if speaker_mel_len >= seq_len {
-            // Truncate: take first seq_len frames from speaker mel
-            speaker_tensor.narrow(1, 0, seq_len)?
-        } else {
-            // Pad: repeat speaker mel to fill seq_len
-            let repeat_factor = (seq_len + speaker_mel_len - 1) / speaker_mel_len;
-            let repeated = speaker_tensor.repeat(&[1, repeat_factor, 1])?;
-            repeated.narrow(1, 0, seq_len)?
-        };
+        let prompt_len = (seq_len / 8).max(5).min(seq_len - 1).min(speaker_mel_len);
+        eprintln!("DEBUG: Flow matching with seq_len={}, speaker_mel_len={}, prompt_len={}",
+            seq_len, speaker_mel_len, prompt_len);
+
+        // Create prompt_x like Python: mostly ZEROS with only first prompt_len frames from ref mel
+        // Python: prompt_x = torch.zeros_like(x)
+        //         prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
+        // speaker_tensor is [B, T, C] = [1, n_frames, 80]
+        let prompt_region = speaker_tensor.narrow(1, 0, prompt_len)?;  // [B, prompt_len, 80]
+        let zeros_region = Tensor::zeros(
+            (batch_size, seq_len - prompt_len, 80),
+            DType::F32,
+            &self.device
+        )?;
+        let prompt_x_tc = Tensor::cat(&[prompt_region, zeros_region], 1)?;  // [B, seq_len, 80]
 
         // Transpose prompt_x from [B, T, C] to [B, C, T] (Python API format)
         let prompt_x = prompt_x_tc.transpose(1, 2)?;
         let prompt_mean: f32 = prompt_x.mean_all()?.to_scalar()?;
-        eprintln!("DEBUG: prompt_x [B,C,T] shape={:?}, mean: {:.4}",
+        eprintln!("DEBUG: prompt_x [B,C,T] shape={:?}, mean: {:.4} (should be small, mostly zeros)",
             prompt_x.shape(), prompt_mean);
-
-        // Use a small prompt_len to provide mel range anchoring from reference audio
-        // The Python flow matching copies reference mel into the prompt region, which helps
-        // establish the correct mel spectrogram value range (around -6 to -7 for log-mel)
-        // Without this, the DiT output tends to center around 0 instead of the correct range
-        // Note: prompt_len must be < seq_len for the flow matching to work properly
-        let prompt_len = (seq_len / 8).max(5).min(seq_len - 1); // Use 12.5% of sequence as prompt anchor
-        eprintln!("DEBUG: Flow matching with seq_len={}, speaker_mel_len={}, prompt_len={}",
-            seq_len, speaker_mel_len, prompt_len);
 
         // sample() expects [B, C, T] inputs and returns [B, C, T] output
         let mel_spec_ct = self.flow_matching.sample(

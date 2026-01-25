@@ -6,6 +6,25 @@ High-performance Rust implementation of [IndexTTS2](https://github.com/index-tts
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 
+## ⚠️ Current Status: Audio Quality Issues
+
+**The pipeline compiles and runs end-to-end, but the generated audio sounds like noise/rumbling water rather than speech.**
+
+All model weights load correctly, the inference pipeline executes without errors, and mel spectrograms are generated with plausible statistics, but the final audio output is not intelligible speech. See [DEBUGGING.md](DEBUGGING.md) for detailed analysis of what has been investigated and fixed so far.
+
+**What works:**
+- ✅ Full compilation with `cargo build --release`
+- ✅ All 131 unit tests pass
+- ✅ All model weights load (Wav2Vec-BERT, GPT, DiT, BigVGAN)
+- ✅ Pipeline produces audio files at correct sample rate (22050 Hz)
+- ✅ Mel spectrogram values are in expected range (-10 to -6)
+
+**What's broken:**
+- ❌ Generated audio is noise, not speech
+- ❌ Likely remaining issues in DiT/Flow Matching or component interactions
+
+**Help wanted!** If you're familiar with flow matching, diffusion transformers, or the IndexTTS architecture, contributions are welcome.
+
 ## ✨ Features
 
 - 🚀 **Native Performance**: Compiled Rust with GPU acceleration via Candle/CUDA

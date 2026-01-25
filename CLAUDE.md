@@ -1,17 +1,17 @@
 # IndexTTS2 Rust Rewrite Project
 
-## ✅ CURRENT STATUS (January 25, 2026)
+## ⚠️ CURRENT STATUS (January 25, 2026)
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│  STATUS: PROJECT COMPLETE - Full TTS Pipeline Working! 🎉      │
+│  STATUS: PIPELINE RUNS BUT AUDIO IS NOISE                      │
 ├────────────────────────────────────────────────────────────────┤
-│  Phases 1-6: ████████████████████ 36/36 ✅ COMPLETE            │
-│  Phase 7:    ████████████████████ 8/8   ✅ COMPLETE            │
-│  Phase 8:    ████████████████████ 7/7   ✅ COMPLETE            │
-│  Phase 9:    ████████████████████ 12/12 ✅ COMPLETE            │
+│  Code:       ████████████████████ 100% compiles                │
+│  Weights:    ████████████████████ 100% loaded                  │
+│  Tests:      ████████████████████ 131/131 pass                 │
+│  Audio:      ░░░░░░░░░░░░░░░░░░░░ BROKEN (noise output)        │
 │                                                                │
-│  ALL PHASES COMPLETE - Ready for production use!               │
+│  See DEBUGGING.md for investigation details                    │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -19,18 +19,20 @@
 - ✅ Full compilation (`cargo build --release`)
 - ✅ CLI runs with full inference pipeline
 - ✅ ALL model weights properly loaded from checkpoints
-- ✅ Generation loop produces proper output
-- ✅ Pipeline runs end-to-end and generates audio
-- ✅ Audio output: 22050 Hz WAV files (verified working)
+- ✅ Generation loop produces mel codes
+- ✅ Pipeline runs end-to-end and generates WAV files
+- ✅ Audio output: 22050 Hz WAV files (correct format)
 - ✅ All 131 unit tests pass
-- ✅ All 15 integration tests pass (+ 3 optional weight tests)
-- ✅ Zero compiler warnings
-- ✅ Benchmarks created (benches/inference_bench.rs)
-- ✅ API documentation complete
+- ✅ Mel spectrogram values in expected range (-10 to -6)
 
-### Recent Fixes (Jan 25)
-- **FinalLayer AdaLN fix**: Corrected modulate formula `x*(1+scale)+shift` and chunk order `shift, scale`
+### What's Broken ❌
+- ❌ Generated audio sounds like noise/rumbling water, not speech
+- ❌ Generated mel mean (-10) differs from speaker mel (-6.5) by 3.6 dB
+
+### Fixes Applied (Jan 25) - Still Not Working
+- **FinalLayer AdaLN fix**: Added SiLU, fixed chunk order `shift, scale`, fixed formula `x*(1+scale)+shift`
 - **LengthRegulator GroupNorm**: Changed from LayerNorm to GroupNorm, fixed interpolate→conv order
+- **prompt_x format**: Changed to mostly zeros with only prompt region filled (matching Python)
 
 ### Model Weight Loading Status ✅
 ```
