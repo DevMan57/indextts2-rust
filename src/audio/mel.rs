@@ -111,11 +111,12 @@ impl MelSpectrogram {
     /// * `audio` - Audio samples (mono, f32, normalized to [-1, 1])
     ///
     /// # Returns
-    /// Mel spectrogram as Vec<Vec<f32>> where shape is [n_frames, n_mels]
+    /// Mel spectrogram as `Vec<Vec<f32>>` where shape is `[n_frames, n_mels]`
     pub fn compute(&self, audio: &[f32]) -> Result<Vec<Vec<f32>>> {
         let stft = self.stft(audio)?;
-        let power_spec = self.power_spectrum(&stft);
-        let mel_spec = self.apply_mel_filters(&power_spec);
+        // Use magnitude (not power) to match Python: torch.sqrt(spec.pow(2).sum(-1) + 1e-9)
+        let magnitude_spec = self.magnitude_spectrum(&stft);
+        let mel_spec = self.apply_mel_filters(&magnitude_spec);
         let log_mel = self.log_compress(&mel_spec);
         Ok(log_mel)
     }
@@ -147,6 +148,11 @@ impl MelSpectrogram {
 
     /// Short-time Fourier transform
     fn stft(&self, audio: &[f32]) -> Result<Vec<Vec<Complex<f32>>>> {
+        // Handle empty input
+        if audio.is_empty() {
+            return Ok(Vec::new());
+        }
+
         // Pad audio to center windows
         let pad_len = self.n_fft / 2;
         let padded_len = audio.len() + 2 * pad_len;
@@ -193,16 +199,19 @@ impl MelSpectrogram {
         Ok(stft_frames)
     }
 
-    /// Compute power spectrum from STFT (magnitude squared)
-    fn power_spectrum(&self, stft: &[Vec<Complex<f32>>]) -> Vec<Vec<f32>> {
+    /// Compute magnitude spectrum from STFT
+    ///
+    /// Uses magnitude (|z| = sqrt(re² + im²)) NOT power (|z|²)
+    /// This matches Python: torch.sqrt(spec.pow(2).sum(-1) + 1e-9)
+    fn magnitude_spectrum(&self, stft: &[Vec<Complex<f32>>]) -> Vec<Vec<f32>> {
         stft.iter()
-            .map(|frame| frame.iter().map(|c| c.norm_sqr()).collect())
+            .map(|frame| frame.iter().map(|c| c.norm()).collect())
             .collect()
     }
 
-    /// Apply mel filterbank to power spectrum
-    fn apply_mel_filters(&self, power_spec: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        power_spec.iter()
+    /// Apply mel filterbank to magnitude spectrum
+    fn apply_mel_filters(&self, mag_spec: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        mag_spec.iter()
             .map(|frame| {
                 self.mel_filters.iter()
                     .map(|filter| {
@@ -216,10 +225,10 @@ impl MelSpectrogram {
             .collect()
     }
 
-    /// Apply log compression (log10 scale, similar to librosa)
+    /// Apply log compression (natural log, matching Python dynamic_range_compression_torch)
     fn log_compress(&self, mel_spec: &[Vec<f32>]) -> Vec<Vec<f32>> {
-        // Use a floor value to prevent log(0)
-        const LOG_FLOOR: f32 = 1e-10;
+        // Floor value matching Python: torch.clamp(x, min=1e-5)
+        const LOG_FLOOR: f32 = 1e-5;
 
         mel_spec.iter()
             .map(|frame| {
@@ -349,5 +358,36 @@ mod tests {
         let result = mel.compute(&[]).unwrap();
         // Should handle empty input gracefully
         assert!(result.len() <= 1);
+    }
+
+    #[test]
+    fn test_mel_output_range() {
+        let mel = MelSpectrogram::new_default();
+        // Create a normalized sine wave
+        let samples: Vec<f32> = (0..22050)
+            .map(|i| 0.5 * (2.0 * PI * 440.0 * i as f32 / 22050.0).sin())
+            .collect();
+
+        let result = mel.compute(&samples).unwrap();
+
+        // All values should be finite (not NaN or infinite)
+        for frame in &result {
+            for &val in frame {
+                assert!(val.is_finite(), "Mel value should be finite");
+            }
+        }
+    }
+
+    #[test]
+    fn test_mel_frame_count() {
+        let mel = MelSpectrogram::new_default();
+        // 1 second of audio at 22050 Hz with hop_length 256
+        let samples: Vec<f32> = vec![0.0; 22050];
+        let result = mel.compute(&samples).unwrap();
+
+        // Expected frames = ceil((samples - n_fft) / hop_length) + 1
+        // For 22050 samples, 1024 n_fft, 256 hop: (22050 - 1024) / 256 + 1 ≈ 83 frames
+        assert!(result.len() > 80);
+        assert!(result.len() < 100);
     }
 }

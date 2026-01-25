@@ -346,7 +346,7 @@ mod tests {
         // Identical values
         let expected = vec![1.0, 2.0, 3.0];
         let actual = vec![1.0, 2.0, 3.0];
-        let (max_diff, mean_diff, num_diffs, _) = validator.compare_values(&expected, &actual);
+        let (max_diff, _mean_diff, num_diffs, _) = validator.compare_values(&expected, &actual);
         assert_eq!(max_diff, 0.0);
         assert_eq!(num_diffs, 0);
 

@@ -1,17 +1,18 @@
 //! Length regulator for mel code expansion
 //!
-//! Expands discrete mel codes to target length for synthesis.
-//! Handles duration prediction and alignment between semantic
-//! codes and mel spectrogram frames.
+//! Processes continuous features from GPT and expands them to target length for synthesis.
+//! The input is 1024-dim continuous features (after gpt_layer projection).
 //!
-//! Architecture:
-//! - Content embedding (discrete codes to continuous)
-//! - Duration predictor (optional)
-//! - Length expansion via upsampling
+//! Architecture (from checkpoint):
+//! - content_in_proj: Linear [512, 1024] - projects input to 512-dim
+//! - model: Conv1d blocks for processing
+//! - Duration prediction for length expansion
+
+#![allow(missing_docs)]
 
 use anyhow::Result;
 use candle_core::{Device, Tensor, DType, IndexOp};
-use candle_nn::{Linear, Module, LayerNorm};
+use candle_nn::{Linear, Module, LayerNorm, VarBuilder};
 use std::path::Path;
 
 /// Conv1d block for duration prediction
@@ -108,42 +109,167 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
     (one + exp_x)?.log().map_err(Into::into)
 }
 
+/// Mish activation: x * tanh(softplus(x))
+/// Unlike ReLU, Mish preserves negative values and has smoother gradients
+fn mish(x: &Tensor) -> Result<Tensor> {
+    let sp = softplus(x)?;
+    let tanh_sp = sp.tanh()?;
+    (x * tanh_sp).map_err(Into::into)
+}
+
 /// Length regulator configuration
 pub struct LengthRegulatorConfig {
     pub channels: usize,
     pub in_channels: usize,
-    pub is_discrete: bool,
-    pub content_codebook_size: usize,
-    pub sampling_ratios: Vec<usize>,
 }
 
 impl Default for LengthRegulatorConfig {
     fn default() -> Self {
         Self {
             channels: 512,
-            in_channels: 1024,
-            is_discrete: false,
-            content_codebook_size: 2048,
-            sampling_ratios: vec![1, 1, 1, 1],
+            in_channels: 1024, // Input from gpt_layer projection
         }
     }
 }
 
-/// Length regulator for expanding mel codes
+/// GPT layer projection (from s2mel checkpoint)
+/// Projects GPT mel embeddings (1280-dim) to length regulator input (1024-dim)
+pub struct GptLayerProjection {
+    layer0: Linear, // [256, 1280]
+    layer1: Linear, // [128, 256]
+    layer2: Linear, // [1024, 128]
+}
+
+impl GptLayerProjection {
+    fn new(device: &Device) -> Result<Self> {
+        // Random init for now
+        let w0 = Tensor::randn(0.0f32, 0.02, (256, 1280), device)?;
+        let b0 = Tensor::zeros((256,), DType::F32, device)?;
+        let w1 = Tensor::randn(0.0f32, 0.02, (128, 256), device)?;
+        let b1 = Tensor::zeros((128,), DType::F32, device)?;
+        let w2 = Tensor::randn(0.0f32, 0.02, (1024, 128), device)?;
+        let b2 = Tensor::zeros((1024,), DType::F32, device)?;
+
+        Ok(Self {
+            layer0: Linear::new(w0, Some(b0)),
+            layer1: Linear::new(w1, Some(b1)),
+            layer2: Linear::new(w2, Some(b2)),
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // x: (batch, seq, 1280)
+        // NOTE: No activation functions between layers - this is a simple MLP projection
+        // The Python checkpoint shows only Linear layers (0, 1, 2) with no intermediate activations
+        let x = self.layer0.forward(x)?; // -> (batch, seq, 256)
+        let x = self.layer1.forward(&x)?; // -> (batch, seq, 128)
+        let x = self.layer2.forward(&x)?; // -> (batch, seq, 1024)
+        Ok(x)
+    }
+}
+
+/// Conv1d + GroupNorm block (matching Python's architecture)
+/// Python uses: nn.Conv1d -> nn.GroupNorm(groups=1, channels) -> nn.Mish()
+/// GroupNorm with groups=1 normalizes across all channels for each spatial position
+struct ConvGNBlock {
+    conv_weight: Tensor,
+    conv_bias: Tensor,
+    gn_weight: Tensor,
+    gn_bias: Tensor,
+    kernel_size: usize,
+    num_groups: usize,
+}
+
+impl ConvGNBlock {
+    fn new(channels: usize, kernel_size: usize, num_groups: usize, device: &Device) -> Result<Self> {
+        let conv_weight = Tensor::randn(
+            0.0f32,
+            0.02,
+            (channels, channels, kernel_size),
+            device,
+        )?;
+        let conv_bias = Tensor::zeros((channels,), DType::F32, device)?;
+        let gn_weight = Tensor::ones((channels,), DType::F32, device)?;
+        let gn_bias = Tensor::zeros((channels,), DType::F32, device)?;
+
+        Ok(Self {
+            conv_weight,
+            conv_bias,
+            gn_weight,
+            gn_bias,
+            kernel_size,
+            num_groups,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // x: (batch, channels, seq)
+        let padding = self.kernel_size / 2;
+        let x = x.conv1d(&self.conv_weight, padding, 1, 1, 1)?;
+        let bias = self.conv_bias.unsqueeze(0)?.unsqueeze(2)?;
+        let x = x.broadcast_add(&bias)?;
+
+        // GroupNorm: normalize across channel groups for each spatial position
+        // When num_groups=1, this normalizes across ALL channels (like LayerNorm on channels)
+        // x: (batch, channels, seq)
+        let (batch, channels, seq) = x.dims3()?;
+        let channels_per_group = channels / self.num_groups;
+
+        // Reshape to (batch, num_groups, channels_per_group, seq)
+        let x = x.reshape((batch, self.num_groups, channels_per_group, seq))?;
+
+        // Compute mean and variance over (channels_per_group, seq) for each group
+        // Flatten last two dims for easier computation
+        let x_flat = x.reshape((batch, self.num_groups, channels_per_group * seq))?;
+        let mean = x_flat.mean_keepdim(2)?; // (batch, num_groups, 1)
+        let var = x_flat.var_keepdim(2)?;   // (batch, num_groups, 1)
+
+        // Normalize
+        let eps = 1e-5;
+        let mean = mean.unsqueeze(3)?; // (batch, num_groups, 1, 1)
+        let var = var.unsqueeze(3)?;   // (batch, num_groups, 1, 1)
+        let x_centered = x.broadcast_sub(&mean)?;
+        let std = (var + eps)?.sqrt()?;
+        let x_norm = x_centered.broadcast_div(&std)?;
+
+        // Reshape back to (batch, channels, seq)
+        let x = x_norm.reshape((batch, channels, seq))?;
+
+        // Apply learnable affine transform (per-channel)
+        let gn_weight = self.gn_weight.unsqueeze(0)?.unsqueeze(2)?; // (1, channels, 1)
+        let gn_bias = self.gn_bias.unsqueeze(0)?.unsqueeze(2)?;     // (1, channels, 1)
+        let x = x.broadcast_mul(&gn_weight)?;
+        let x = x.broadcast_add(&gn_bias)?;
+
+        // Mish activation: x * tanh(softplus(x))
+        mish(&x)
+    }
+}
+
+/// Length regulator for processing GPT features
 ///
-/// Takes discrete or continuous mel codes and expands them to
-/// the target mel spectrogram length using predicted durations.
+/// Takes continuous 1024-dim features from gpt_layer and processes them
+/// for mel spectrogram synthesis.
+///
+/// CRITICAL: Python's order of operations:
+/// 1. content_in_proj: project to 512 dims
+/// 2. F.interpolate with mode='nearest' to expand sequence length
+/// 3. Apply conv+groupnorm+mish blocks on EXPANDED sequence
+/// 4. Final conv layer
 pub struct LengthRegulator {
     device: Device,
     config: LengthRegulatorConfig,
-    /// Content embedding (for discrete codes)
-    content_embedding: Option<Tensor>,
-    /// Input projection
-    input_proj: Option<Linear>,
-    /// Duration predictor
-    duration_predictor: Option<DurationPredictor>,
-    /// Output projection
-    output_proj: Option<Linear>,
+    /// GPT layer projection (1280 -> 1024)
+    gpt_layer: Option<GptLayerProjection>,
+    /// Content input projection [512, 1024]
+    content_in_proj: Option<Linear>,
+    /// Conv model blocks (Conv + GroupNorm + Mish) - applied AFTER interpolation
+    conv_blocks: Vec<ConvGNBlock>,
+    /// Final conv layer [512, 512, 1]
+    final_conv_weight: Option<Tensor>,
+    final_conv_bias: Option<Tensor>,
+    /// Number of groups for GroupNorm (default 1)
+    num_groups: usize,
     /// Whether initialized
     weights_loaded: bool,
 }
@@ -159,10 +285,12 @@ impl LengthRegulator {
         Ok(Self {
             device: device.clone(),
             config,
-            content_embedding: None,
-            input_proj: None,
-            duration_predictor: None,
-            output_proj: None,
+            gpt_layer: None,
+            content_in_proj: None,
+            conv_blocks: Vec::new(),
+            final_conv_weight: None,
+            final_conv_bias: None,
+            num_groups: 1, // Python default: nn.GroupNorm(1, channels)
             weights_loaded: false,
         })
     }
@@ -176,17 +304,10 @@ impl LengthRegulator {
 
     /// Initialize with random weights
     pub fn initialize_random(&mut self) -> Result<()> {
-        // Content embedding for discrete codes
-        if self.config.is_discrete {
-            self.content_embedding = Some(Tensor::randn(
-                0.0f32,
-                0.02,
-                (self.config.content_codebook_size, self.config.channels),
-                &self.device,
-            )?);
-        }
+        // GPT layer projection
+        self.gpt_layer = Some(GptLayerProjection::new(&self.device)?);
 
-        // Input projection
+        // Content input projection [512, 1024]
         let w = Tensor::randn(
             0.0f32,
             0.02,
@@ -194,61 +315,210 @@ impl LengthRegulator {
             &self.device,
         )?;
         let b = Tensor::zeros((self.config.channels,), DType::F32, &self.device)?;
-        self.input_proj = Some(Linear::new(w, Some(b)));
+        self.content_in_proj = Some(Linear::new(w, Some(b)));
 
-        // Duration predictor
-        self.duration_predictor = Some(DurationPredictor::new(
-            self.config.channels,
-            &self.device,
-        )?);
+        // Conv model: 4 conv+groupnorm+mish blocks with kernel sizes [3, 3, 3, 3]
+        // Python: nn.Conv1d -> nn.GroupNorm(1, channels) -> nn.Mish()
+        self.conv_blocks.clear();
+        for _ in 0..4 {
+            self.conv_blocks.push(ConvGNBlock::new(self.config.channels, 3, self.num_groups, &self.device)?);
+        }
 
-        // Output projection
-        let w = Tensor::randn(
+        // Final conv [512, 512, 1]
+        self.final_conv_weight = Some(Tensor::randn(
             0.0f32,
             0.02,
-            (self.config.channels, self.config.channels),
+            (self.config.channels, self.config.channels, 1),
             &self.device,
-        )?;
-        let b = Tensor::zeros((self.config.channels,), DType::F32, &self.device)?;
-        self.output_proj = Some(Linear::new(w, Some(b)));
+        )?);
+        self.final_conv_bias = Some(Tensor::zeros((self.config.channels,), DType::F32, &self.device)?);
 
         self.weights_loaded = true;
         Ok(())
     }
 
-    /// Load weights from file
+    /// Load weights from safetensors file
     pub fn load_weights<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path = path.as_ref();
         if !path.exists() {
+            eprintln!("LengthRegulator: checkpoint not found at {:?}, using random weights", path);
             return self.initialize_random();
         }
-        self.initialize_random()
+
+        eprintln!("LengthRegulator: Loading weights from {:?}", path);
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[path], DType::F32, &self.device)?
+        };
+
+        // Load gpt_layer (the projection from GPT embeddings)
+        let gpt_vb = vb.pp("gpt_layer");
+        let w0 = gpt_vb.get((256, 1280), "0.weight")?;
+        let b0 = gpt_vb.get(256, "0.bias")?;
+        let w1 = gpt_vb.get((128, 256), "1.weight")?;
+        let b1 = gpt_vb.get(128, "1.bias")?;
+        let w2 = gpt_vb.get((1024, 128), "2.weight")?;
+        let b2 = gpt_vb.get(1024, "2.bias")?;
+        self.gpt_layer = Some(GptLayerProjection {
+            layer0: Linear::new(w0, Some(b0)),
+            layer1: Linear::new(w1, Some(b1)),
+            layer2: Linear::new(w2, Some(b2)),
+        });
+
+        // Load content_in_proj
+        let lr_vb = vb.pp("length_regulator");
+        let w = lr_vb.get((512, 1024), "content_in_proj.weight")?;
+        let b = lr_vb.get(512, "content_in_proj.bias")?;
+        self.content_in_proj = Some(Linear::new(w, Some(b)));
+
+        // Load conv model blocks
+        // Python structure: Conv1d, GroupNorm, Mish (indices 0,1,2 / 3,4,5 / 6,7,8 / 9,10,11)
+        // model.0 (conv), model.1 (groupnorm), model.2 (mish - no params), etc.
+        self.conv_blocks.clear();
+        let conv_indices = [(0, 1), (3, 4), (6, 7), (9, 10)]; // (conv_idx, gn_idx)
+        for (conv_idx, gn_idx) in conv_indices {
+            let conv_weight = lr_vb.get((512, 512, 3), &format!("model.{}.weight", conv_idx))?;
+            let conv_bias = lr_vb.get(512, &format!("model.{}.bias", conv_idx))?;
+            let gn_weight = lr_vb.get(512, &format!("model.{}.weight", gn_idx))?;
+            let gn_bias = lr_vb.get(512, &format!("model.{}.bias", gn_idx))?;
+
+            self.conv_blocks.push(ConvGNBlock {
+                conv_weight,
+                conv_bias,
+                gn_weight,
+                gn_bias,
+                kernel_size: 3,
+                num_groups: self.num_groups,
+            });
+        }
+
+        // Load final conv (model.12)
+        self.final_conv_weight = Some(lr_vb.get((512, 512, 1), "model.12.weight")?);
+        self.final_conv_bias = Some(lr_vb.get(512, "model.12.bias")?);
+
+        self.weights_loaded = true;
+        eprintln!("LengthRegulator: Weights loaded successfully");
+        Ok(())
     }
 
-    /// Embed discrete codes
-    fn embed_codes(&self, codes: &Tensor) -> Result<Tensor> {
-        if let Some(ref emb) = self.content_embedding {
-            let flat = codes.flatten_all()?;
-            let embedded = emb.index_select(&flat, 0)?;
-            let (batch, seq) = codes.dims2()?;
-            Ok(embedded.reshape((batch, seq, self.config.channels))?)
+    /// Project GPT mel embeddings through gpt_layer
+    /// Input: (batch, seq, 1280) - mel embeddings from GPT
+    /// Output: (batch, seq, 1024) - features for length regulator
+    pub fn project_gpt_embeddings(&self, embeddings: &Tensor) -> Result<Tensor> {
+        if let Some(ref gpt_layer) = self.gpt_layer {
+            gpt_layer.forward(embeddings)
         } else {
-            anyhow::bail!("Content embedding not initialized for discrete input")
+            anyhow::bail!("GPT layer projection not initialized")
         }
+    }
+
+    /// Forward pass
+    ///
+    /// # Arguments
+    /// * `features` - Continuous features (batch, seq, 1024) from gpt_layer projection
+    /// * `target_lengths` - Optional target lengths for each batch item
+    ///
+    /// # Returns
+    /// * Tuple of (processed features, durations)
+    ///
+    /// CRITICAL: Order of operations matches Python:
+    /// 1. content_in_proj: (batch, seq, 1024) -> (batch, seq, 512)
+    /// 2. F.interpolate to target_length FIRST (nearest neighbor)
+    /// 3. Apply conv+groupnorm+mish blocks on EXPANDED sequence
+    /// 4. Final conv layer
+    pub fn forward(
+        &self,
+        features: &Tensor,
+        target_lengths: Option<&[usize]>,
+    ) -> Result<(Tensor, Tensor)> {
+        if !self.weights_loaded {
+            let batch = features.dim(0)?;
+            let seq_len = features.dim(1)?;
+            let target_len = target_lengths.map(|l| l[0]).unwrap_or(seq_len);
+            let output = Tensor::zeros(
+                (batch, target_len, self.config.channels),
+                DType::F32,
+                &self.device,
+            )?;
+            let durations = Tensor::ones((batch, seq_len), DType::F32, &self.device)?;
+            return Ok((output, durations));
+        }
+
+        // Step 1: Project input from 1024 to 512 dims
+        let x = if let Some(ref proj) = self.content_in_proj {
+            proj.forward(features)?
+        } else {
+            features.clone()
+        };
+
+        // Transpose for conv1d: (batch, seq, channels) -> (batch, channels, seq)
+        let mut x = x.transpose(1, 2)?;
+
+        // Step 2: INTERPOLATE FIRST to target length (before conv blocks!)
+        // Python: x = F.interpolate(x.transpose(1, 2).contiguous(), size=ylens.max(), mode='nearest')
+        let (batch_size, _channels, seq_len) = x.dims3()?;
+        let target_len = target_lengths.map(|l| l[0]).unwrap_or(seq_len);
+
+        if target_len != seq_len {
+            // Nearest neighbor interpolation
+            x = self.interpolate_nearest(&x, target_len)?;
+        }
+
+        // Step 3: Apply conv blocks on EXPANDED sequence
+        for block in &self.conv_blocks {
+            x = block.forward(&x)?;
+        }
+
+        // Step 4: Final conv
+        if let (Some(ref w), Some(ref b)) = (&self.final_conv_weight, &self.final_conv_bias) {
+            x = x.conv1d(w, 0, 1, 1, 1)?; // kernel_size=1, no padding
+            let bias = b.unsqueeze(0)?.unsqueeze(2)?;
+            x = x.broadcast_add(&bias)?;
+        }
+
+        // Transpose back: (batch, channels, seq) -> (batch, seq, channels)
+        let x = x.transpose(1, 2)?;
+
+        // Durations are implicit from the interpolation
+        let (_, final_len, _) = x.dims3()?;
+        let durations = Tensor::ones((batch_size, final_len), DType::F32, &self.device)?;
+
+        Ok((x, durations))
+    }
+
+    /// Nearest neighbor interpolation (matching F.interpolate with mode='nearest')
+    fn interpolate_nearest(&self, x: &Tensor, target_len: usize) -> Result<Tensor> {
+        // x: (batch, channels, seq)
+        let (batch, channels, seq) = x.dims3()?;
+
+        if target_len == seq {
+            return Ok(x.clone());
+        }
+
+        // For each target position, find the nearest source position
+        let mut output_data = vec![0.0f32; batch * channels * target_len];
+        let x_vec: Vec<f32> = x.flatten_all()?.to_vec1()?;
+
+        for b in 0..batch {
+            for c in 0..channels {
+                for t in 0..target_len {
+                    // Nearest neighbor: find source index
+                    let src_t = ((t as f32 + 0.5) * (seq as f32) / (target_len as f32)).floor() as usize;
+                    let src_t = src_t.min(seq - 1);
+
+                    let src_idx = b * channels * seq + c * seq + src_t;
+                    let dst_idx = b * channels * target_len + c * target_len + t;
+                    output_data[dst_idx] = x_vec[src_idx];
+                }
+            }
+        }
+
+        Tensor::from_slice(&output_data, (batch, channels, target_len), &self.device)
+            .map_err(Into::into)
     }
 
     /// Expand features using durations
-    ///
-    /// # Arguments
-    /// * `features` - Input features (batch, seq, channels)
-    /// * `durations` - Durations per frame (batch, seq)
-    ///
-    /// # Returns
-    /// * Expanded features (batch, target_len, channels)
     fn length_regulate(&self, features: &Tensor, durations: &Tensor) -> Result<Tensor> {
         let (batch_size, seq_len, channels) = features.dims3()?;
-
-        // Round durations to integers
         let durations_vec: Vec<Vec<f32>> = durations.to_vec2()?;
 
         let mut expanded_batch = Vec::new();
@@ -256,32 +526,22 @@ impl LengthRegulator {
 
         for b in 0..batch_size {
             let mut expanded_frames = Vec::new();
-
             for s in 0..seq_len {
                 let dur = durations_vec[b][s].round().max(1.0) as usize;
-                // Repeat the frame `dur` times
                 for _ in 0..dur {
                     expanded_frames.push((b, s));
                 }
             }
-
             max_len = max_len.max(expanded_frames.len());
             expanded_batch.push(expanded_frames);
         }
 
-        // Build output tensor
         let mut output_data = vec![0.0f32; batch_size * max_len * channels];
-
         for (b, frames) in expanded_batch.iter().enumerate() {
             for (t, &(_, s)) in frames.iter().enumerate() {
-                // Copy features[b, s, :] to output[b, t, :]
-                let _src_offset = b * seq_len * channels + s * channels;
                 let dst_offset = b * max_len * channels + t * channels;
-
-                // We need to get the data from the tensor
                 let frame = features.i((b, s, ..))?;
                 let frame_data: Vec<f32> = frame.to_vec1()?;
-
                 for (c, &val) in frame_data.iter().enumerate() {
                     output_data[dst_offset + c] = val;
                 }
@@ -290,74 +550,6 @@ impl LengthRegulator {
 
         Tensor::from_slice(&output_data, (batch_size, max_len, channels), &self.device)
             .map_err(Into::into)
-    }
-
-    /// Forward pass
-    ///
-    /// # Arguments
-    /// * `codes` - Input codes (batch, seq) for discrete or (batch, seq, dim) for continuous
-    /// * `target_lengths` - Optional target lengths for each batch item
-    ///
-    /// # Returns
-    /// * Tuple of (expanded features, durations)
-    pub fn forward(
-        &self,
-        codes: &Tensor,
-        target_lengths: Option<&[usize]>,
-    ) -> Result<(Tensor, Tensor)> {
-        if !self.weights_loaded {
-            let batch = codes.dim(0)?;
-            let target_len = target_lengths.map(|l| l[0]).unwrap_or(100);
-            let features = Tensor::zeros(
-                (batch, target_len, self.config.channels),
-                DType::F32,
-                &self.device,
-            )?;
-            let durations = Tensor::ones((batch, 1), DType::F32, &self.device)?;
-            return Ok((features, durations));
-        }
-
-        // Get input features
-        let features = if self.config.is_discrete {
-            self.embed_codes(codes)?
-        } else {
-            codes.clone()
-        };
-
-        // Project to internal dimension
-        let features = if let Some(ref proj) = self.input_proj {
-            proj.forward(&features)?
-        } else {
-            features
-        };
-
-        // Predict durations
-        let features_t = features.transpose(1, 2)?; // (batch, channels, seq)
-        let durations = if let Some(ref predictor) = self.duration_predictor {
-            predictor.forward(&features_t)?
-        } else {
-            let (batch, seq, _) = features.dims3()?;
-            Tensor::ones((batch, seq), DType::F32, &self.device)?
-        };
-
-        // Adjust durations to match target length if specified
-        let durations = if let Some(targets) = target_lengths {
-            self.adjust_durations(&durations, targets)?
-        } else {
-            durations
-        };
-
-        // Expand features using durations
-        let expanded = self.length_regulate(&features, &durations)?;
-
-        // Output projection
-        let output = if let Some(ref proj) = self.output_proj {
-            proj.forward(&expanded)?
-        } else {
-            expanded
-        };
-
-        Ok((output, durations))
     }
 
     /// Adjust durations to match target lengths
@@ -369,7 +561,6 @@ impl LengthRegulator {
             if b >= batch_size {
                 break;
             }
-
             let current_sum: f32 = dur_vec[b].iter().sum();
             if current_sum > 0.0 {
                 let scale = target as f32 / current_sum;
@@ -379,7 +570,6 @@ impl LengthRegulator {
             }
         }
 
-        // Flatten and create tensor
         let flat: Vec<f32> = dur_vec.into_iter().flatten().collect();
         Tensor::from_slice(&flat, (batch_size, seq_len), &self.device).map_err(Into::into)
     }
@@ -418,8 +608,9 @@ mod tests {
         let device = Device::Cpu;
         let regulator = LengthRegulator::new(&device).unwrap();
 
-        let codes = Tensor::randn(0.0f32, 1.0, (2, 50, 1024), &device).unwrap();
-        let (expanded, durations) = regulator.forward(&codes, Some(&[100, 100])).unwrap();
+        // Not initialized - should return zeros
+        let features = Tensor::randn(0.0f32, 1.0, (2, 50, 1024), &device).unwrap();
+        let (expanded, _durations) = regulator.forward(&features, Some(&[100, 100])).unwrap();
 
         assert_eq!(expanded.dims3().unwrap(), (2, 100, 512));
     }
@@ -432,28 +623,28 @@ mod tests {
 
         assert!(regulator.is_initialized());
 
-        let codes = Tensor::randn(0.0f32, 1.0, (1, 20, 1024), &device).unwrap();
-        let (expanded, durations) = regulator.forward(&codes, None).unwrap();
+        // Input is 1024-dim continuous features
+        let features = Tensor::randn(0.0f32, 1.0, (1, 20, 1024), &device).unwrap();
+        let (output, _durations) = regulator.forward(&features, None).unwrap();
 
-        // Output should have some length based on predicted durations
-        let (batch, len, channels) = expanded.dims3().unwrap();
+        // Output should be 512-dim features
+        let (batch, len, channels) = output.dims3().unwrap();
         assert_eq!(batch, 1);
+        assert_eq!(len, 20); // Same length (no expansion without target_lengths)
         assert_eq!(channels, 512);
-        assert!(len > 0);
     }
 
     #[test]
-    fn test_softplus() {
+    fn test_gpt_layer_projection() {
         let device = Device::Cpu;
-        let x = Tensor::new(&[0.0f32, 1.0, -1.0], &device).unwrap();
-        let y = softplus(&x).unwrap();
-        let values: Vec<f32> = y.to_vec1().unwrap();
+        let mut regulator = LengthRegulator::new(&device).unwrap();
+        regulator.initialize_random().unwrap();
 
-        // softplus(0) = ln(2) ≈ 0.693
-        assert!((values[0] - 0.693).abs() < 0.01);
-        // softplus(1) ≈ 1.313
-        assert!((values[1] - 1.313).abs() < 0.01);
-        // softplus(-1) ≈ 0.313
-        assert!((values[2] - 0.313).abs() < 0.01);
+        // GPT mel embeddings are 1280-dim
+        let embeddings = Tensor::randn(0.0f32, 1.0, (1, 10, 1280), &device).unwrap();
+        let projected = regulator.project_gpt_embeddings(&embeddings).unwrap();
+
+        // Output should be 1024-dim
+        assert_eq!(projected.dims3().unwrap(), (1, 10, 1024));
     }
 }

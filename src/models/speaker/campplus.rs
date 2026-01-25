@@ -2,7 +2,7 @@
 //!
 //! Extracts speaker identity features from audio using the CAM++ architecture.
 //! Based on "CAM++: A Fast and Efficient Network for Speaker Verification
-//! Using Context-Aware Masking" (https://arxiv.org/abs/2303.00332)
+//! Using Context-Aware Masking" (<https://arxiv.org/abs/2303.00332>)
 //!
 //! Architecture: D-TDNN (Densely-connected Time Delay Neural Network)
 //! - Input: Mel filterbank features (batch, time, 80)

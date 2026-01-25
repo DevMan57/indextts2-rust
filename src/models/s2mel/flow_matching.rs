@@ -6,7 +6,7 @@
 //! - Optimal transport interpolation path
 
 use anyhow::Result;
-use candle_core::{Device, Tensor};
+use candle_core::{Device, DType, Tensor};
 
 use super::dit::DiffusionTransformer;
 
@@ -62,48 +62,68 @@ impl FlowMatching {
     ///
     /// # Arguments
     /// * `model` - DiT model for velocity prediction
-    /// * `x` - Current state (batch, seq_len, mel_channels)
+    /// * `x` - Current state (batch, 80, time) - [B, C, T] format (Python API)
+    /// * `prompt_x` - Reference mel (batch, 80, time) - [B, C, T] format
     /// * `t` - Current timestep (batch,)
-    /// * `content` - Content conditioning
-    /// * `style` - Optional style conditioning
+    /// * `cond` - Semantic conditioning (batch, time, 512) - [B, T, C] format
+    /// * `style` - Speaker style (batch, 192)
     ///
     /// # Returns
-    /// * Predicted velocity (batch, seq_len, mel_channels)
+    /// * Predicted velocity (batch, 80, time) - [B, C, T] format
     fn compute_velocity(
         &self,
         model: &DiffusionTransformer,
         x: &Tensor,
+        prompt_x: &Tensor,
         t: &Tensor,
-        content: &Tensor,
-        style: Option<&Tensor>,
+        cond: &Tensor,
+        style: &Tensor,
     ) -> Result<Tensor> {
-        // Model predicts velocity directly
-        model.forward(x, t, content, style)
+        // DiT expects [B, T, C] format internally, so transpose inputs
+        let x_tc = x.transpose(1, 2)?;            // [B, C, T] -> [B, T, C]
+        let prompt_x_tc = prompt_x.transpose(1, 2)?;  // [B, C, T] -> [B, T, C]
+
+        // Model predicts velocity in [B, T, C] format
+        let v_tc = model.forward(&x_tc, &prompt_x_tc, t, cond, style)?;
+
+        // Transpose output back to [B, C, T]
+        v_tc.transpose(1, 2).map_err(Into::into)
     }
 
     /// Compute velocity with classifier-free guidance
+    ///
+    /// Python formula: dphi_dt = (1 + cfg_rate) * v_cond - cfg_rate * v_uncond
+    /// This is equivalent to: v_cond + cfg_rate * (v_cond - v_uncond)
     fn compute_velocity_cfg(
         &self,
         model: &DiffusionTransformer,
         x: &Tensor,
+        prompt_x: &Tensor,
         t: &Tensor,
-        content: &Tensor,
-        style: Option<&Tensor>,
+        cond: &Tensor,
+        style: &Tensor,
     ) -> Result<Tensor> {
-        if !self.config.use_cfg || self.config.cfg_rate == 1.0 {
-            return self.compute_velocity(model, x, t, content, style);
+        if !self.config.use_cfg || self.config.cfg_rate == 0.0 {
+            return self.compute_velocity(model, x, prompt_x, t, cond, style);
         }
 
-        // Conditional velocity
-        let v_cond = self.compute_velocity(model, x, t, content, style)?;
+        // Conditional velocity (with style and conditioning)
+        let v_cond = self.compute_velocity(model, x, prompt_x, t, cond, style)?;
 
-        // Unconditional velocity (no style)
-        let v_uncond = self.compute_velocity(model, x, t, content, None)?;
+        // Unconditional velocity (zero style, conditioning, AND prompt_x for CFG)
+        // Python: stacked_prompt_x = torch.cat([prompt_x, torch.zeros_like(prompt_x)], dim=0)
+        // So the unconditional path gets zeros for prompt_x as well
+        let zero_style = Tensor::zeros_like(style)?;
+        let zero_cond = Tensor::zeros_like(cond)?;
+        let zero_prompt_x = Tensor::zeros_like(prompt_x)?;
+        let v_uncond = self.compute_velocity(model, x, &zero_prompt_x, t, &zero_cond, &zero_style)?;
 
-        // CFG: v = v_uncond + cfg_rate * (v_cond - v_uncond)
+        // CFG formula from Python: (1 + rate) * v_cond - rate * v_uncond
+        // = v_cond + rate * (v_cond - v_uncond)
         let cfg = self.config.cfg_rate as f64;
-        let diff = (&v_cond - &v_uncond)?;
-        (&v_uncond + (diff * cfg)?).map_err(Into::into)
+        let scaled_cond = (&v_cond * (1.0 + cfg))?;
+        let scaled_uncond = (&v_uncond * cfg)?;
+        (scaled_cond - scaled_uncond).map_err(Into::into)
     }
 
     /// Euler step for ODE integration
@@ -113,10 +133,11 @@ impl FlowMatching {
         &self,
         model: &DiffusionTransformer,
         x: &Tensor,
+        prompt_x: &Tensor,
         t: f32,
         dt: f32,
-        content: &Tensor,
-        style: Option<&Tensor>,
+        cond: &Tensor,
+        style: &Tensor,
     ) -> Result<Tensor> {
         let batch_size = x.dim(0)?;
 
@@ -128,40 +149,74 @@ impl FlowMatching {
         )?;
 
         // Compute velocity
-        let v = self.compute_velocity_cfg(model, x, &t_tensor, content, style)?;
+        let v = self.compute_velocity_cfg(model, x, prompt_x, &t_tensor, cond, style)?;
 
-        // Euler integration
+        // Standard Euler integration: x_{t+dt} = x_t + dt * v
+        // NO velocity scaling - matches Python: x = x + dt * dphi_dt
         (x + (v * dt as f64)?).map_err(Into::into)
     }
 
     /// Sample mel spectrogram using flow matching
     ///
     /// Integrates the ODE from t=0 (noise) to t=1 (data)
+    /// Uses [B, C, T] format (batch, 80, time) to match Python API
     ///
     /// # Arguments
     /// * `model` - DiT model
-    /// * `noise` - Initial noise (batch, seq_len, mel_channels)
-    /// * `content` - Content features (batch, seq_len, content_dim)
-    /// * `style` - Optional style embedding (batch, style_dim)
+    /// * `noise` - Initial noise (batch, 80, time) - [B, C, T] format
+    /// * `prompt_x` - Reference mel (batch, 80, time) - [B, C, T] format
+    /// * `cond` - Semantic conditioning (batch, time, 512) - [B, T, C] format
+    /// * `style` - Speaker style (batch, 192)
+    /// * `prompt_len` - Number of frames in prompt region (to be preserved from prompt_x)
     ///
     /// # Returns
-    /// * Generated mel spectrogram (batch, seq_len, mel_channels)
+    /// * Generated mel spectrogram (batch, 80, time) - [B, C, T] format
     pub fn sample(
         &self,
         model: &DiffusionTransformer,
         noise: &Tensor,
-        content: &Tensor,
-        style: Option<&Tensor>,
+        prompt_x: &Tensor,
+        cond: &Tensor,
+        style: &Tensor,
+        prompt_len: usize,
     ) -> Result<Tensor> {
         let num_steps = self.config.num_steps;
         let dt = 1.0 / num_steps as f32;
+        // [B, C, T] format: time is dimension 2
+        let time_len = noise.dim(2)?;
 
         let mut x = noise.clone();
+
+        // Zero out prompt region initially (Python: x[..., :prompt_len] = 0)
+        // In [B, C, T] format, we narrow on dimension 2 (time)
+        if prompt_len > 0 && prompt_len < time_len {
+            // Create mask: zeros for prompt region, keep generation region
+            let zeros = Tensor::zeros((1, 80, prompt_len), DType::F32, &self.device)?;
+            let gen_part = x.narrow(2, prompt_len, time_len - prompt_len)?;
+            x = Tensor::cat(&[zeros, gen_part], 2)?;
+        }
 
         // Euler integration from t=0 to t=1
         for step in 0..num_steps {
             let t = step as f32 / num_steps as f32;
-            x = self.euler_step(model, &x, t, dt, content, style)?;
+            x = self.euler_step(model, &x, prompt_x, t, dt, cond, style)?;
+
+            // Zero out prompt region after each step (Python: x[..., :prompt_len] = 0)
+            // The prompt region is preserved from prompt_x, not generated
+            // In [B, C, T] format, we narrow on dimension 2 (time)
+            if prompt_len > 0 && prompt_len < time_len {
+                let zeros = Tensor::zeros((1, 80, prompt_len), DType::F32, &self.device)?;
+                let gen_part = x.narrow(2, prompt_len, time_len - prompt_len)?;
+                x = Tensor::cat(&[zeros, gen_part], 2)?;
+            }
+        }
+
+        // Copy prompt region from prompt_x into the final output
+        // Python: final_mel[..., :prompt_len] = prompt[..., :prompt_len]
+        if prompt_len > 0 && prompt_len < time_len {
+            let prompt_part = prompt_x.narrow(2, 0, prompt_len)?;
+            let gen_part = x.narrow(2, prompt_len, time_len - prompt_len)?;
+            x = Tensor::cat(&[prompt_part, gen_part], 2)?;
         }
 
         Ok(x)
@@ -170,12 +225,24 @@ impl FlowMatching {
     /// Sample with adaptive step size (Heun's method)
     ///
     /// More accurate than Euler but requires 2 function evaluations per step
+    /// Uses [B, C, T] format (batch, 80, time) to match Python API
+    ///
+    /// # Arguments
+    /// * `model` - DiT model
+    /// * `noise` - Initial noise (batch, 80, time) - [B, C, T] format
+    /// * `prompt_x` - Reference mel (batch, 80, time) - [B, C, T] format
+    /// * `cond` - Semantic conditioning (batch, time, 512) - [B, T, C] format
+    /// * `style` - Speaker style (batch, 192)
+    ///
+    /// # Returns
+    /// * Generated mel spectrogram (batch, 80, time) - [B, C, T] format
     pub fn sample_heun(
         &self,
         model: &DiffusionTransformer,
         noise: &Tensor,
-        content: &Tensor,
-        style: Option<&Tensor>,
+        prompt_x: &Tensor,
+        cond: &Tensor,
+        style: &Tensor,
     ) -> Result<Tensor> {
         let num_steps = self.config.num_steps;
         let dt = 1.0 / num_steps as f32;
@@ -193,7 +260,7 @@ impl FlowMatching {
                 (batch_size,),
                 &self.device,
             )?;
-            let v1 = self.compute_velocity_cfg(model, &x, &t_tensor, content, style)?;
+            let v1 = self.compute_velocity_cfg(model, &x, prompt_x, &t_tensor, cond, style)?;
 
             // Euler prediction
             let x_pred = (&x + (&v1 * dt as f64)?)?;
@@ -204,7 +271,7 @@ impl FlowMatching {
                 (batch_size,),
                 &self.device,
             )?;
-            let v2 = self.compute_velocity_cfg(model, &x_pred, &t_next_tensor, content, style)?;
+            let v2 = self.compute_velocity_cfg(model, &x_pred, prompt_x, &t_next_tensor, cond, style)?;
 
             // Heun's correction: x = x + dt * (v1 + v2) / 2
             let v_avg = ((&v1 + &v2)? * 0.5)?;
@@ -222,13 +289,15 @@ impl FlowMatching {
     /// Compute training loss (for reference)
     ///
     /// CFM loss: ||v_theta(x_t, t) - (x_1 - x_0)||^2
+    /// Uses [B, C, T] format (batch, 80, time) to match Python API
     ///
     /// # Arguments
     /// * `model` - DiT model
-    /// * `x0` - Noise samples
-    /// * `x1` - Target mel spectrograms
-    /// * `content` - Content conditioning
-    /// * `style` - Style conditioning
+    /// * `x0` - Noise samples (batch, 80, time) - [B, C, T] format
+    /// * `x1` - Target mel spectrograms (batch, 80, time) - [B, C, T] format
+    /// * `prompt_x` - Reference mel (batch, 80, time) - [B, C, T] format
+    /// * `cond` - Semantic conditioning (batch, time, 512) - [B, T, C] format
+    /// * `style` - Speaker style (batch, 192)
     ///
     /// # Returns
     /// * MSE loss
@@ -237,8 +306,9 @@ impl FlowMatching {
         model: &DiffusionTransformer,
         x0: &Tensor,
         x1: &Tensor,
-        content: &Tensor,
-        style: Option<&Tensor>,
+        prompt_x: &Tensor,
+        cond: &Tensor,
+        style: &Tensor,
     ) -> Result<Tensor> {
         let batch_size = x0.dim(0)?;
 
@@ -248,17 +318,25 @@ impl FlowMatching {
             .collect();
         let t = Tensor::from_slice(&t_vals, (batch_size,), &self.device)?;
 
-        // Interpolate: x_t = (1-t) * x0 + t * x1
+        // Interpolate in [B, C, T] space: x_t = (1-t) * x0 + t * x1
+        // t shape: (B,) -> need to expand to (B, 1, 1) for broadcasting
         let t_expanded = t.unsqueeze(1)?.unsqueeze(2)?;
         let t_expanded = t_expanded.broadcast_as(x0.shape())?;
         let one_minus_t = (1.0 - &t_expanded)?;
         let x_t = (one_minus_t.mul(x0)? + t_expanded.mul(x1)?)?;
 
-        // Target velocity: x1 - x0
+        // Target velocity in [B, C, T]: x1 - x0
         let target = (x1 - x0)?;
 
-        // Predicted velocity
-        let pred = model.forward(&x_t, &t, content, style)?;
+        // Transpose to [B, T, C] for DiT
+        let x_t_tc = x_t.transpose(1, 2)?;
+        let prompt_x_tc = prompt_x.transpose(1, 2)?;
+
+        // Predicted velocity in [B, T, C]
+        let pred_tc = model.forward(&x_t_tc, &prompt_x_tc, &t, cond, style)?;
+
+        // Transpose prediction back to [B, C, T] for loss computation
+        let pred = pred_tc.transpose(1, 2)?;
 
         // MSE loss
         let diff = (&pred - &target)?;
@@ -301,35 +379,42 @@ mod tests {
         let device = Device::Cpu;
         let fm = FlowMatching::new(&device);
 
-        let noise = fm.sample_noise(&[2, 100, 80]).unwrap();
-        assert_eq!(noise.dims(), &[2, 100, 80]);
+        // [B, C, T] format: (batch, 80, time)
+        let noise = fm.sample_noise(&[2, 80, 100]).unwrap();
+        assert_eq!(noise.dims(), &[2, 80, 100]);
     }
 
     #[test]
     fn test_flow_matching_sample() {
         let device = Device::Cpu;
 
-        // Create DiT model (uninitialized returns input)
-        let dit = DiffusionTransformer::new(&device).unwrap();
+        // Create DiT model with random weights
+        let mut dit = DiffusionTransformer::new(&device).unwrap();
+        dit.initialize_random().unwrap();
 
         // Use fewer steps for faster test
         let config = FlowMatchingConfig {
-            num_steps: 5,
+            num_steps: 3,
             cfg_rate: 0.7,
             sigma_min: 1e-4,
             use_cfg: false, // Disable CFG for simpler test
         };
         let fm = FlowMatching::with_config(config, &device);
 
-        let noise = fm.sample_noise(&[1, 50, 80]).unwrap();
-        let content = Tensor::randn(0.0f32, 1.0, (1, 50, 512), &device).unwrap();
+        // [B, C, T] format for noise and prompt_x
+        let noise = fm.sample_noise(&[1, 80, 50]).unwrap();
+        let prompt_x = Tensor::zeros((1, 80, 50), DType::F32, &device).unwrap();
+        // cond stays [B, T, C] as DiT expects this for conditioning
+        let cond = Tensor::randn(0.0f32, 1.0, (1, 50, 512), &device).unwrap();
+        let style = Tensor::randn(0.0f32, 1.0, (1, 192), &device).unwrap();
 
-        let mel = fm.sample(&dit, &noise, &content, None).unwrap();
-        assert_eq!(mel.dims3().unwrap(), (1, 50, 80));
+        let mel = fm.sample(&dit, &noise, &prompt_x, &cond, &style, 0).unwrap();
+        // Output is [B, C, T] = (1, 80, 50)
+        assert_eq!(mel.dims3().unwrap(), (1, 80, 50));
     }
 
     #[test]
-    fn test_flow_matching_sample_with_style() {
+    fn test_flow_matching_sample_with_cfg() {
         let device = Device::Cpu;
 
         let mut dit = DiffusionTransformer::new(&device).unwrap();
@@ -343,22 +428,27 @@ mod tests {
         };
         let fm = FlowMatching::with_config(config, &device);
 
-        let noise = fm.sample_noise(&[1, 20, 80]).unwrap();
-        let content = Tensor::randn(0.0f32, 1.0, (1, 20, 512), &device).unwrap();
+        // [B, C, T] format for noise and prompt_x
+        let noise = fm.sample_noise(&[1, 80, 20]).unwrap();
+        let prompt_x = Tensor::zeros((1, 80, 20), DType::F32, &device).unwrap();
+        // cond stays [B, T, C]
+        let cond = Tensor::randn(0.0f32, 1.0, (1, 20, 512), &device).unwrap();
         let style = Tensor::randn(0.0f32, 1.0, (1, 192), &device).unwrap();
 
-        let mel = fm.sample(&dit, &noise, &content, Some(&style)).unwrap();
-        let (batch, len, channels) = mel.dims3().unwrap();
+        let mel = fm.sample(&dit, &noise, &prompt_x, &cond, &style, 5).unwrap();
+        // Output is [B, C, T]
+        let (batch, channels, time) = mel.dims3().unwrap();
         assert_eq!(batch, 1);
-        assert_eq!(len, 20);
         assert_eq!(channels, 80);
+        assert_eq!(time, 20);
     }
 
     #[test]
     fn test_flow_matching_sample_heun() {
         let device = Device::Cpu;
 
-        let dit = DiffusionTransformer::new(&device).unwrap();
+        let mut dit = DiffusionTransformer::new(&device).unwrap();
+        dit.initialize_random().unwrap();
 
         let config = FlowMatchingConfig {
             num_steps: 3,
@@ -368,11 +458,16 @@ mod tests {
         };
         let fm = FlowMatching::with_config(config, &device);
 
-        let noise = fm.sample_noise(&[1, 30, 80]).unwrap();
-        let content = Tensor::randn(0.0f32, 1.0, (1, 30, 512), &device).unwrap();
+        // [B, C, T] format for noise and prompt_x
+        let noise = fm.sample_noise(&[1, 80, 30]).unwrap();
+        let prompt_x = Tensor::zeros((1, 80, 30), DType::F32, &device).unwrap();
+        // cond stays [B, T, C]
+        let cond = Tensor::randn(0.0f32, 1.0, (1, 30, 512), &device).unwrap();
+        let style = Tensor::randn(0.0f32, 1.0, (1, 192), &device).unwrap();
 
-        let mel = fm.sample_heun(&dit, &noise, &content, None).unwrap();
-        assert_eq!(mel.dims3().unwrap(), (1, 30, 80));
+        let mel = fm.sample_heun(&dit, &noise, &prompt_x, &cond, &style).unwrap();
+        // Output is [B, C, T]
+        assert_eq!(mel.dims3().unwrap(), (1, 80, 30));
     }
 
     #[test]
@@ -384,11 +479,15 @@ mod tests {
 
         let fm = FlowMatching::new(&device);
 
-        let x0 = Tensor::randn(0.0f32, 1.0, (2, 10, 80), &device).unwrap();
-        let x1 = Tensor::randn(0.0f32, 1.0, (2, 10, 80), &device).unwrap();
-        let content = Tensor::randn(0.0f32, 1.0, (2, 10, 512), &device).unwrap();
+        // compute_loss uses [B, C, T] format for x0, x1, prompt_x
+        let x0 = Tensor::randn(0.0f32, 1.0, (2, 80, 10), &device).unwrap();
+        let x1 = Tensor::randn(0.0f32, 1.0, (2, 80, 10), &device).unwrap();
+        let prompt_x = Tensor::zeros((2, 80, 10), DType::F32, &device).unwrap();
+        // cond stays [B, T, C]
+        let cond = Tensor::randn(0.0f32, 1.0, (2, 10, 512), &device).unwrap();
+        let style = Tensor::randn(0.0f32, 1.0, (2, 192), &device).unwrap();
 
-        let loss = fm.compute_loss(&dit, &x0, &x1, &content, None).unwrap();
+        let loss = fm.compute_loss(&dit, &x0, &x1, &prompt_x, &cond, &style).unwrap();
         let loss_val: f32 = loss.to_scalar().unwrap();
 
         // Loss should be positive

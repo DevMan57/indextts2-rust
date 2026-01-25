@@ -1,8 +1,7 @@
-//! BPE Tokenization
+//! Text Tokenization
 //!
-//! Wrapper around HuggingFace tokenizers for BPE-based text tokenization.
-//! Supports loading from JSON tokenizer files and provides comprehensive
-//! encode/decode functionality.
+//! Wrapper around HuggingFace tokenizers for text tokenization.
+//! Supports loading from tokenizer.json files (Unigram/BPE models).
 
 use anyhow::Result;
 use std::path::Path;
@@ -10,9 +9,75 @@ use tokenizers::Tokenizer;
 
 use super::TextNormalizer;
 
-/// BPE-based text tokenizer
+/// Tokenize text by inserting spaces around CJK characters
+/// This matches the Python tokenize_by_CJK_char function
+fn tokenize_by_cjk_char(text: &str) -> String {
+    let mut result = String::with_capacity(text.len() * 2);
+
+    for c in text.chars() {
+        // Check if character is CJK
+        if is_cjk_character(c) {
+            // Add space before and after CJK character
+            if !result.is_empty() && !result.ends_with(' ') {
+                result.push(' ');
+            }
+            result.push(c);
+            result.push(' ');
+        } else {
+            result.push(c);
+        }
+    }
+
+    // Clean up multiple spaces
+    let mut cleaned = String::with_capacity(result.len());
+    let mut prev_was_space = true;
+    for c in result.chars() {
+        if c == ' ' {
+            if !prev_was_space {
+                cleaned.push(' ');
+                prev_was_space = true;
+            }
+        } else {
+            cleaned.push(c);
+            prev_was_space = false;
+        }
+    }
+
+    cleaned.trim().to_string()
+}
+
+/// Check if a character is a CJK character
+fn is_cjk_character(c: char) -> bool {
+    let cp = c as u32;
+
+    // CJK Unified Ideographs
+    (0x4E00..=0x9FFF).contains(&cp) ||
+    // CJK Unified Ideographs Extension A
+    (0x3400..=0x4DBF).contains(&cp) ||
+    // CJK Unified Ideographs Extension B
+    (0x20000..=0x2A6DF).contains(&cp) ||
+    // CJK Unified Ideographs Extension C
+    (0x2A700..=0x2B73F).contains(&cp) ||
+    // CJK Unified Ideographs Extension D
+    (0x2B740..=0x2B81F).contains(&cp) ||
+    // CJK Unified Ideographs Extension E
+    (0x2B820..=0x2CEAF).contains(&cp) ||
+    // CJK Unified Ideographs Extension F
+    (0x2CEB0..=0x2EBEF).contains(&cp) ||
+    // CJK Compatibility Ideographs
+    (0xF900..=0xFAFF).contains(&cp) ||
+    // CJK Compatibility Ideographs Supplement
+    (0x2F800..=0x2FA1F).contains(&cp)
+}
+
+/// Check if text contains any CJK characters
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(is_cjk_character)
+}
+
+/// HuggingFace tokenizers-based text tokenizer
 pub struct TextTokenizer {
-    /// Underlying HuggingFace tokenizer
+    /// Underlying tokenizer
     tokenizer: Tokenizer,
     /// Text normalizer for preprocessing
     normalizer: TextNormalizer,
@@ -25,23 +90,29 @@ pub struct TextTokenizer {
 }
 
 impl TextTokenizer {
-    /// Load tokenizer from a BPE model file (JSON format)
-    pub fn load<P: AsRef<Path>>(bpe_path: P, normalizer: TextNormalizer) -> Result<Self> {
-        let tokenizer = Tokenizer::from_file(bpe_path.as_ref())
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {:?}: {}", bpe_path.as_ref(), e))?;
+    /// Load tokenizer from a tokenizer.json file
+    pub fn load<P: AsRef<Path>>(model_path: P, normalizer: TextNormalizer) -> Result<Self> {
+        let path = model_path.as_ref();
 
-        // Get special token IDs
+        // Check if file exists
+        if !path.exists() {
+            anyhow::bail!("Tokenizer model not found: {:?}", path);
+        }
+
+        let tokenizer = Tokenizer::from_file(path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer from {:?}: {}", path, e))?;
+
+        // Get UNK token ID (default to 2)
         let unk_token_id = tokenizer
-            .token_to_id("[UNK]")
-            .or_else(|| tokenizer.token_to_id("<unk>"))
-            .unwrap_or(0);
+            .token_to_id("<unk>")
+            .unwrap_or(2);
 
         Ok(Self {
             tokenizer,
             normalizer,
             unk_token_id,
-            start_text_token: 0,  // Will be set from config
-            stop_text_token: 1,   // Will be set from config
+            start_text_token: 0,  // <s> token
+            stop_text_token: 1,   // </s> token
         })
     }
 
@@ -51,11 +122,31 @@ impl TextTokenizer {
         self.stop_text_token = stop;
     }
 
+    /// Preprocess text: normalize and uppercase English
+    fn preprocess(&self, text: &str) -> String {
+        // Normalize text
+        let normalized = self.normalizer.normalize(text);
+
+        // Check if text contains CJK characters
+        if contains_cjk(&normalized) {
+            // For Chinese text, apply CJK pre-tokenization
+            tokenize_by_cjk_char(&normalized)
+        } else {
+            // For English text, convert to uppercase
+            // The vocabulary uses uppercase English tokens
+            normalized.to_uppercase()
+        }
+    }
+
     /// Tokenize text into token strings
     pub fn tokenize(&self, text: &str) -> Result<Vec<String>> {
-        let normalized = self.normalizer.normalize(text);
-        let encoding = self.tokenizer
-            .encode(normalized.as_str(), false)
+        if text.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let preprocessed = self.preprocess(text);
+
+        let encoding = self.tokenizer.encode(preprocessed, false)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
         Ok(encoding.get_tokens().to_vec())
@@ -63,9 +154,13 @@ impl TextTokenizer {
 
     /// Encode text directly to token IDs (most common use case)
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let normalized = self.normalizer.normalize(text);
-        let encoding = self.tokenizer
-            .encode(normalized.as_str(), false)
+        if text.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let preprocessed = self.preprocess(text);
+
+        let encoding = self.tokenizer.encode(preprocessed, false)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
         Ok(encoding.get_ids().to_vec())
@@ -96,8 +191,7 @@ impl TextTokenizer {
 
     /// Decode token IDs back to text
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
-        self.tokenizer
-            .decode(ids, true) // skip_special_tokens = true
+        self.tokenizer.decode(ids, true)
             .map_err(|e| anyhow::anyhow!("Decoding failed: {}", e))
     }
 
@@ -125,8 +219,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_normalizer_integration() {
-        let normalizer = TextNormalizer::new(false);
-        // Test would require actual tokenizer file
+    fn test_cjk_tokenization() {
+        let result = tokenize_by_cjk_char("你好world");
+        // CJK characters are separated by spaces
+        // Output: "你 好 world" (first char has no leading space)
+        assert!(result.contains("你 "));
+        assert!(result.contains("好 "));
+        // Also test middle positions
+        let result2 = tokenize_by_cjk_char("hello你好world");
+        assert!(result2.contains(" 你 "));
+        assert!(result2.contains(" 好 "));
+    }
+
+    #[test]
+    fn test_is_cjk_character() {
+        assert!(is_cjk_character('你'));
+        assert!(is_cjk_character('好'));
+        assert!(!is_cjk_character('a'));
+        assert!(!is_cjk_character('!'));
+    }
+
+    #[test]
+    fn test_contains_cjk() {
+        assert!(contains_cjk("你好世界"));
+        assert!(contains_cjk("Hello 你好"));
+        assert!(!contains_cjk("Hello World"));
     }
 }

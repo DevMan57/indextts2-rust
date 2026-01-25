@@ -24,15 +24,23 @@ pub struct ModelConfig {
     
     /// Wav2Vec-BERT stats filename
     pub w2v_stat: String,
-    
+
+    /// Wav2Vec-BERT model filename (full model weights)
+    #[serde(default)]
+    pub w2v_model: Option<String>,
+
     /// S2Mel checkpoint filename
     pub s2mel_checkpoint: String,
-    
+
     /// Emotion matrix filename
     pub emo_matrix: String,
-    
+
     /// Speaker matrix filename
     pub spk_matrix: String,
+
+    /// BigVGAN checkpoint filename
+    #[serde(default)]
+    pub bigvgan_checkpoint: Option<String>,
     
     /// Emotion class counts per category
     pub emo_num: Vec<usize>,

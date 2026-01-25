@@ -429,9 +429,9 @@ impl AdaLayerNorm {
         let scale = scale.unsqueeze(1)?;
         let shift = shift.unsqueeze(1)?;
 
-        // Apply: (1 + scale) * normalized + shift
-        // Center scale around 1 for stable training
-        let scale = (scale + 1.0)?;
+        // Apply: scale * normalized + shift
+        // Python formula: return weight * self.norm(input) + bias
+        // NO +1 offset - the model was trained without it
         (normalized.broadcast_mul(&scale)?).broadcast_add(&shift).map_err(Into::into)
     }
 }
@@ -1153,19 +1153,24 @@ impl FinalLayer {
     }
 
     fn forward(&self, x: &Tensor, t_emb: &Tensor) -> Result<Tensor> {
-        // Get scale and shift from time embedding
-        let params = self.adaln.forward(t_emb)?;
+        // Get shift and scale from time embedding
+        // Python: shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        // Note: adaLN_modulation is Sequential(SiLU(), Linear(...))
+        let t_emb_silu = silu(t_emb)?;  // Apply SiLU first!
+        let params = self.adaln.forward(&t_emb_silu)?;
         let chunks = params.chunk(2, D::Minus1)?;
-        let scale = &chunks[0];
-        let shift = &chunks[1];
+        let shift = &chunks[0];  // Python: shift is FIRST
+        let scale = &chunks[1];  // Python: scale is SECOND
 
         // Apply layer norm
         let x = self.norm.forward(x)?;
 
-        // Apply scale and shift (broadcast over sequence)
-        let scale = scale.unsqueeze(1)?;  // [B, 1, 512]
-        let shift = shift.unsqueeze(1)?;
-        let x = (x.broadcast_mul(&(scale + 1.0)?)?).broadcast_add(&shift)?;
+        // Apply modulate: x * (1 + scale) + shift
+        // Python: def modulate(x, shift, scale): return x * (1 + scale) + shift
+        let shift = shift.unsqueeze(1)?;  // [B, 1, 512]
+        let scale = scale.unsqueeze(1)?;
+        let scale_plus_one = (scale + 1.0)?;
+        let x = (x.broadcast_mul(&scale_plus_one)?).broadcast_add(&shift)?;
 
         // Apply linear
         self.linear.forward(&x).map_err(Into::into)
@@ -1803,6 +1808,56 @@ impl DiffusionTransformer {
                 let h_sum: f32 = h.sum_all().unwrap().to_scalar().unwrap();
                 let h_numel = h.elem_count();
                 eprintln!("DEBUG conv2 check: h sum={:.4}, numel={}", h_sum, h_numel);
+            });
+
+            // Manual conv2 computation with detailed debug
+            static ONCE_CONV2_MANUAL: std::sync::Once = std::sync::Once::new();
+            let mut manual_result = None;
+            ONCE_CONV2_MANUAL.call_once(|| {
+                // Get weight and bias
+                let weight = proj.weight();  // [80, 512]
+                let bias = proj.bias();      // Some([80])
+
+                // Manual computation for first position
+                let h_slice: Vec<f32> = h.i((0, 0, ..)).unwrap().to_vec1().unwrap();  // [512]
+                let weight_data: Vec<Vec<f32>> = (0..80).map(|c| {
+                    weight.i(c).unwrap().to_vec1().unwrap()
+                }).collect();
+
+                // Compute output for each channel
+                let mut out_manual: Vec<f32> = Vec::new();
+                for c in 0..80 {
+                    let mut sum: f32 = 0.0;
+                    for j in 0..512 {
+                        sum += h_slice[j] * weight_data[c][j];
+                    }
+                    if let Some(ref b) = bias {
+                        let b_vec: Vec<f32> = b.to_vec1().unwrap();
+                        sum += b_vec[c];
+                    }
+                    out_manual.push(sum);
+                }
+
+                let manual_mean: f32 = out_manual.iter().sum::<f32>() / 80.0;
+                let manual_min: f32 = out_manual.iter().cloned().fold(f32::INFINITY, f32::min);
+                let manual_max: f32 = out_manual.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+                // Also compute using Linear.forward for comparison
+                let h_pos0 = h.i((0..1, 0..1, ..)).unwrap();  // [1, 1, 512]
+                let linear_out = proj.forward(&h_pos0).unwrap();  // [1, 1, 80]
+                let linear_vec: Vec<f32> = linear_out.flatten_all().unwrap().to_vec1().unwrap();
+                let linear_mean: f32 = linear_vec.iter().sum::<f32>() / 80.0;
+
+                eprintln!("DEBUG conv2 MANUAL pos0: mean={:.4}, min={:.4}, max={:.4}", manual_mean, manual_min, manual_max);
+                eprintln!("DEBUG conv2 LINEAR pos0: mean={:.4}", linear_mean);
+
+                // Check input stats for pos0
+                let h_mean: f32 = h_slice.iter().sum::<f32>() / 512.0;
+                let h_min: f32 = h_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+                let h_max: f32 = h_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                eprintln!("DEBUG conv2 input pos0: mean={:.4}, min={:.4}, max={:.4}", h_mean, h_min, h_max);
+
+                manual_result = Some(manual_mean);
             });
 
             let output = proj.forward(&h)?;  // [B, T, 80]

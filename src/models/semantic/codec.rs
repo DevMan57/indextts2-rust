@@ -139,13 +139,17 @@ impl SemanticCodec {
             // Direct projection if no learned layer
             if hidden != self.codebook_dim {
                 // Simple linear projection placeholder
+                // Flatten to 2D, project, reshape back to 3D
+                let (batch, seq, _) = embeddings.dims3()?;
+                let flat = embeddings.reshape((batch * seq, hidden))?;
                 let weight = Tensor::randn(
                     0.0f32,
                     0.02,
                     (hidden, self.codebook_dim),
                     &self.device,
                 )?;
-                embeddings.matmul(&weight)?
+                let projected_flat = flat.matmul(&weight)?;
+                projected_flat.reshape((batch, seq, self.codebook_dim))?
             } else {
                 embeddings.clone()
             }
@@ -177,13 +181,17 @@ impl SemanticCodec {
             proj.forward(&quantized_codes)?
         } else if self.codebook_dim != self.hidden_size {
             // Simple projection back
+            // Flatten to 2D, project, reshape back to 3D
+            let (batch, seq, _) = quantized_codes.dims3()?;
+            let flat = quantized_codes.reshape((batch * seq, self.codebook_dim))?;
             let weight = Tensor::randn(
                 0.0f32,
                 0.02,
                 (self.codebook_dim, self.hidden_size),
                 &self.device,
             )?;
-            quantized_codes.matmul(&weight)?
+            let projected_flat = flat.matmul(&weight)?;
+            projected_flat.reshape((batch, seq, self.hidden_size))?
         } else {
             quantized_codes
         };
@@ -269,7 +277,7 @@ impl SemanticCodec {
                 (self.codebook_dim, self.hidden_size),
                 &self.device,
             )?;
-            quantized_codes.matmul(&weight).map_err(Into::into)
+            quantized_codes.broadcast_matmul(&weight).map_err(Into::into)
         } else {
             Ok(quantized_codes)
         }
@@ -339,10 +347,10 @@ mod tests {
         let input = Tensor::randn(0.0f32, 1.0, (1, 50, 1024), &device).unwrap();
         let (_, codes) = codec.quantize(&input).unwrap();
 
-        // Verify codes are in valid range
-        let codes_vec: Vec<i64> = codes.flatten_all().unwrap().to_vec1().unwrap();
+        // Verify codes are in valid range (argmin returns U32)
+        let codes_vec: Vec<u32> = codes.flatten_all().unwrap().to_vec1().unwrap();
         for code in codes_vec {
-            assert!(code >= 0 && code < 8192, "Code {} out of range", code);
+            assert!(code < 8192, "Code {} out of range", code);
         }
     }
 }

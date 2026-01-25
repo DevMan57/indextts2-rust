@@ -282,10 +282,12 @@ impl IndexTTS2 {
             let available_keys: Vec<String> = tensors.keys().cloned().collect();
 
             // Expected key patterns for DiT (actual naming from IndexTTS s2mel checkpoint)
+            // Note: Uses combined wqkv.weight instead of separate wq/wk/wv
             let expected_keys: HashSet<String> = [
                 "cfm.estimator.transformer.layers.0.feed_forward.w1.weight",
                 "cfm.estimator.transformer.layers.0.feed_forward.w2.weight",
-                "cfm.estimator.transformer.layers.0.attention.wq.weight",
+                "cfm.estimator.transformer.layers.0.attention.wqkv.weight",  // Combined QKV
+                "cfm.estimator.transformer.layers.0.attention.wo.weight",    // Output projection
                 "cfm.estimator.x_embedder.weight_v",
                 "cfm.estimator.t_embedder.mlp.0.weight",
                 "length_regulator.model.0.weight",
@@ -319,16 +321,22 @@ impl IndexTTS2 {
                 let tensors = diagnostics.load_safetensors(&vocoder_path, "BigVGAN", &self.device)?;
                 let available_keys: Vec<String> = tensors.keys().cloned().collect();
 
-                // Expected key patterns for BigVGAN (actual naming from NVIDIA checkpoint)
+                // Expected key patterns for BigVGAN (NVIDIA checkpoint uses weight normalization)
+                // Raw tensor names have .weight_g/.weight_v instead of .weight
                 let expected_keys: HashSet<String> = [
-                    "conv_pre.weight",
+                    "conv_pre.weight_g",
+                    "conv_pre.weight_v",
                     "conv_pre.bias",
-                    "ups.0.weight",
-                    "ups.0.bias",
-                    "resblocks.0.convs1.0.weight",
+                    "ups.0.0.weight_g",  // Note: has extra .0. in path
+                    "ups.0.0.weight_v",
+                    "ups.0.0.bias",
+                    "resblocks.0.convs1.0.weight_g",
+                    "resblocks.0.convs1.0.weight_v",
                     "resblocks.0.convs1.0.bias",
                     "resblocks.0.activations.0.act.alpha",
-                    "conv_post.weight",
+                    "resblocks.0.activations.0.act.beta",
+                    "conv_post.weight_g",
+                    "conv_post.weight_v",
                 ].iter().map(|s| s.to_string()).collect();
 
                 diagnostics.record_component(
@@ -532,9 +540,15 @@ impl IndexTTS2 {
             s_infer.shape(), si_mean, si_var);
 
         // Step 4: Process through length regulator (1024 → 512)
+        // CRITICAL: Apply 1.72× temporal expansion ratio (from Python reference)
+        // Each mel code needs to be expanded to ~1.72 mel frames
+        let num_mel_codes = s_infer.dim(1)?;
+        let target_len = ((num_mel_codes as f32) * 1.72).round() as usize;
+        eprintln!("DEBUG: Length expansion: {} codes → {} frames (ratio 1.72×)", num_mel_codes, target_len);
+
         let (content_features, _durations) = self.length_regulator.forward(
             &s_infer,
-            None,
+            Some(&[target_len]),
         )?;
 
         // Debug: Check content features
@@ -566,19 +580,20 @@ impl IndexTTS2 {
         }
 
         // 6. Flow matching synthesis
+        // Python uses [B, C, T] format at API level, transposes to [B, T, C] internally
+        // Our Rust uses [B, T, C] internally, so we transpose at boundaries
         let (batch_size, seq_len, _) = content_features.dims3()?;
-        let noise = self.flow_matching.sample_noise(&[batch_size, seq_len, 80])?;
 
-        // Mel normalization constants - the model was trained on normalized mels
-        // These values center the log-mel range around 0 with reasonable variance
-        // Note: Common TTS normalization uses mean=-5 to -7, std=4 to 5
-        // Trying mean=-5.5, std=2 based on speaker mel distribution
-        const MEL_MEAN: f64 = -5.5;  // Center of typical log-mel range
-        const MEL_STD: f64 = 2.0;    // Typical dynamic range (try smaller for more aggressive normalization)
+        // Create noise in [B, C, T] format (Python format)
+        let noise = self.flow_matching.sample_noise(&[batch_size, 80, seq_len])?;
+
+        // NO mel normalization - Python does NOT normalize before flow matching!
+        // The mel spectrogram is already in log-compressed form from mel extraction
 
         // Create prompt_x from reference mel by padding/truncating to match seq_len
+        // speaker_tensor is [B, T, C] = [1, n_frames, 80]
         let speaker_mel_len = speaker_tensor.dim(1)?;
-        let prompt_x_raw = if speaker_mel_len >= seq_len {
+        let prompt_x_tc = if speaker_mel_len >= seq_len {
             // Truncate: take first seq_len frames from speaker mel
             speaker_tensor.narrow(1, 0, seq_len)?
         } else {
@@ -588,29 +603,44 @@ impl IndexTTS2 {
             repeated.narrow(1, 0, seq_len)?
         };
 
-        // Normalize prompt_x: (mel - mean) / std
-        let prompt_x = ((&prompt_x_raw - MEL_MEAN)? / MEL_STD)?;
-        let prompt_norm_mean: f32 = prompt_x.mean_all()?.to_scalar()?;
-        eprintln!("DEBUG: Normalized prompt_x mean: {:.4} (raw mean: {:.4})",
-            prompt_norm_mean, speaker_tensor.mean_all()?.to_scalar::<f32>()?);
+        // Transpose prompt_x from [B, T, C] to [B, C, T] (Python API format)
+        let prompt_x = prompt_x_tc.transpose(1, 2)?;
+        let prompt_mean: f32 = prompt_x.mean_all()?.to_scalar()?;
+        eprintln!("DEBUG: prompt_x [B,C,T] shape={:?}, mean: {:.4}",
+            prompt_x.shape(), prompt_mean);
 
-        // For pure TTS (not inpainting), use prompt_len=0 to generate entire sequence
-        // The reference mel in prompt_x provides conditioning context but we generate all frames
-        // Note: If doing audio continuation/inpainting, set prompt_len = speaker_mel_len.min(seq_len)
-        let prompt_len = 0; // Pure TTS mode
+        // Use a small prompt_len to provide mel range anchoring from reference audio
+        // The Python flow matching copies reference mel into the prompt region, which helps
+        // establish the correct mel spectrogram value range (around -6 to -7 for log-mel)
+        // Without this, the DiT output tends to center around 0 instead of the correct range
+        // Note: prompt_len must be < seq_len for the flow matching to work properly
+        let prompt_len = (seq_len / 8).max(5).min(seq_len - 1); // Use 12.5% of sequence as prompt anchor
         eprintln!("DEBUG: Flow matching with seq_len={}, speaker_mel_len={}, prompt_len={}",
             seq_len, speaker_mel_len, prompt_len);
-        let mel_spec_normalized = self.flow_matching.sample(
+
+        // sample() expects [B, C, T] inputs and returns [B, C, T] output
+        let mel_spec_ct = self.flow_matching.sample(
             &self.dit,
-            &noise,
-            &prompt_x,
-            &content_features,
-            &speaker_emb,
+            &noise,        // [B, C, T] = [B, 80, T]
+            &prompt_x,     // [B, C, T] = [B, 80, T]
+            &content_features,  // [B, T, C] = [B, T, 512] - unchanged, DiT handles this
+            &speaker_emb,  // [B, C] = [B, 192]
             prompt_len,
         )?;
 
-        // Denormalize output: mel = norm_mel * std + mean
-        let mel_spec = ((&mel_spec_normalized * MEL_STD)? + MEL_MEAN)?;
+        // Transpose output from [B, C, T] back to [B, T, C] for vocoder transpose
+        let mel_spec_full = mel_spec_ct.transpose(1, 2)?;
+
+        // CRITICAL: Strip prompt region from output (Python does this!)
+        // Python: vc_target = vc_target[:, :, ref_mel.size(-1):]  # Only keep generated part
+        let mel_spec = if prompt_len > 0 && prompt_len < mel_spec_full.dim(1)? {
+            let gen_len = mel_spec_full.dim(1)? - prompt_len;
+            eprintln!("DEBUG: Stripping prompt region: {} frames, keeping {} generated frames",
+                prompt_len, gen_len);
+            mel_spec_full.narrow(1, prompt_len, gen_len)?
+        } else {
+            mel_spec_full
+        };
 
         // Debug: Check mel spectrogram output
         let mel_mean: f32 = mel_spec.mean_all()?.to_scalar()?;

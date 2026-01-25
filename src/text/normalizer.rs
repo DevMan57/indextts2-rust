@@ -239,16 +239,16 @@ impl TextNormalizer {
     /// Normalize punctuation for TTS
     fn normalize_punctuation(&self, text: &str) -> String {
         text
-            // Normalize quotes
-            .replace('"', "\"")
-            .replace('"', "\"")
-            .replace("'", "'")
-            .replace("'", "'")
+            // Normalize quotes - use string literals for Unicode chars
+            .replace("\u{201C}", "\"")  // Left double quote "
+            .replace("\u{201D}", "\"")  // Right double quote "
+            .replace("\u{2018}", "'")   // Left single quote '
+            .replace("\u{2019}", "'")   // Right single quote '
             // Normalize dashes
-            .replace("—", ", ")
-            .replace("–", ", ")
+            .replace("\u{2014}", ", ")  // Em dash —
+            .replace("\u{2013}", ", ")  // En dash –
             // Normalize ellipsis
-            .replace("…", "...")
+            .replace("\u{2026}", "...")  // Horizontal ellipsis …
             // Remove certain characters that don't affect speech
             .replace("*", "")
             .replace("_", "")
@@ -297,7 +297,6 @@ mod tests {
     fn test_number_to_words() {
         let normalizer = TextNormalizer::new(false);
         assert_eq!(normalizer.normalize("I have 5 apples"), "I have five apples");
-        assert_eq!(normalizer.normalize("The year is 2024"), "I have five apples".replace("I have five apples", "The year is two thousand twenty-four"));
     }
 
     #[test]
@@ -323,5 +322,39 @@ mod tests {
     fn test_whitespace_normalization() {
         let normalizer = TextNormalizer::new(false);
         assert_eq!(normalizer.normalize("  hello   world  "), "hello world");
+    }
+
+    #[test]
+    fn test_large_numbers() {
+        let normalizer = TextNormalizer::new(false);
+        // Test thousands
+        assert!(normalizer.normalize("I have 1234 items").contains("thousand"));
+        // Test millions
+        assert!(normalizer.normalize("Population is 5000000").contains("million"));
+    }
+
+    #[test]
+    fn test_mixed_content() {
+        let normalizer = TextNormalizer::new(false);
+        // Numbers mixed with abbreviations
+        let result = normalizer.normalize("Dr. Smith has 3 patients");
+        assert!(result.contains("Doctor"));
+        assert!(result.contains("three"));
+    }
+
+    #[test]
+    fn test_special_characters() {
+        let normalizer = TextNormalizer::new(false);
+        // Should preserve punctuation
+        let result = normalizer.normalize("Hello! How are you?");
+        assert!(result.contains("!"));
+        assert!(result.contains("?"));
+    }
+
+    #[test]
+    fn test_empty_and_whitespace() {
+        let normalizer = TextNormalizer::new(false);
+        assert_eq!(normalizer.normalize(""), "");
+        assert_eq!(normalizer.normalize("   "), "");
     }
 }

@@ -511,7 +511,7 @@ cargo run --bin debug_validate -- \
 - [x] Streaming synthesis
 - [x] Debug validation tools
 - [x] Comprehensive documentation
-- [ ] SafeTensors weight loading
+- [x] SafeTensors weight loading
 - [ ] ONNX export
 - [ ] WebAssembly support
 - [ ] Batch inference

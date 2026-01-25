@@ -268,13 +268,19 @@ impl CachedAttention {
             .reshape((batch_size, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
 
+        // Make tensors contiguous
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+
         // Append to cache and get full K, V
         let (k, v) = cache.append(&k, &v)?;
         let kv_seq_len = k.dim(2)?;
 
         // Scaled dot-product attention
         let scale = (self.head_dim as f64).sqrt();
-        let attn_weights = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        let attn_weights = q.matmul(&k_t)?;
         let attn_weights = (attn_weights / scale)?;
 
         // Apply causal mask if needed
@@ -292,11 +298,13 @@ impl CachedAttention {
         };
 
         let attn_weights = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-        let attn_output = attn_weights.matmul(&v)?;
+        let v = v.contiguous()?;
+        let attn_output = attn_weights.contiguous()?.matmul(&v)?;
 
         // Reshape back
         let attn_output = attn_output
             .transpose(1, 2)?
+            .contiguous()?
             .reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
 
         candle_nn::Module::forward(&self.out_proj, &attn_output).map_err(Into::into)
@@ -348,7 +356,7 @@ mod tests {
         // First append
         let k1 = Tensor::randn(0.0f32, 1.0, (1, 8, 5, 64), &device).unwrap();
         let v1 = Tensor::randn(0.0f32, 1.0, (1, 8, 5, 64), &device).unwrap();
-        let (keys, values) = cache.append(&k1, &v1).unwrap();
+        let (keys, _values) = cache.append(&k1, &v1).unwrap();
 
         assert_eq!(keys.dims4().unwrap(), (1, 8, 5, 64));
         assert_eq!(cache.current_seq_len(), 5);
@@ -356,7 +364,7 @@ mod tests {
         // Second append
         let k2 = Tensor::randn(0.0f32, 1.0, (1, 8, 1, 64), &device).unwrap();
         let v2 = Tensor::randn(0.0f32, 1.0, (1, 8, 1, 64), &device).unwrap();
-        let (keys, values) = cache.append(&k2, &v2).unwrap();
+        let (keys, _values) = cache.append(&k2, &v2).unwrap();
 
         assert_eq!(keys.dims4().unwrap(), (1, 8, 6, 64));
         assert_eq!(cache.current_seq_len(), 6);

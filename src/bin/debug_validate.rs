@@ -237,15 +237,17 @@ fn validate_s2mel(validator: &mut Validator, device: &Device) -> Result<()> {
     dit.initialize_random()?;
 
     let x = Tensor::randn(0.0f32, 1.0, (1, 100, 80), device)?;
+    let prompt_x = Tensor::zeros((1, 100, 80), candle_core::DType::F32, device)?;
     let t = Tensor::new(&[0.0f32], device)?;
-    let content = Tensor::randn(0.0f32, 1.0, (1, 100, 512), device)?;
-    let step_00 = dit.forward(&x, &t, &content, None)?;
+    let cond = Tensor::randn(0.0f32, 1.0, (1, 100, 512), device)?;
+    let style = Tensor::randn(0.0f32, 1.0, (1, 192), device)?;
+    let step_00 = dit.forward(&x, &prompt_x, &t, &cond, &style)?;
     validator.validate_tensor("dit_step_00", &step_00, "synthesis")?;
 
     // Flow matching
     let fm = FlowMatching::new(device);
     let noise = fm.sample_noise(&[1, 100, 80])?;
-    let mel_spec = fm.sample(&dit, &noise, &content, None)?;
+    let mel_spec = fm.sample(&dit, &noise, &prompt_x, &cond, &style, 0)?;
     validator.validate_tensor("mel_spec", &mel_spec, "synthesis")?;
 
     Ok(())

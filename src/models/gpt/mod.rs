@@ -11,9 +11,11 @@ mod perceiver;
 mod kv_cache;
 mod unified_voice;
 mod generation;
+mod weights;
 
 pub use conformer::ConformerEncoder;
 pub use perceiver::PerceiverResampler;
 pub use kv_cache::KVCache;
 pub use unified_voice::UnifiedVoice;
-pub use generation::{GenerationConfig, generate};
+pub use generation::{GenerationConfig, generate, generate_with_hidden};
+pub use weights::{load_safetensors, Gpt2LayerWeights};
