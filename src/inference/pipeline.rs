@@ -19,7 +19,7 @@ use crate::audio::{AudioLoader, Resampler, MelSpectrogram, AudioOutput};
 use crate::models::semantic::{SemanticEncoder, SemanticCodec};
 use crate::models::speaker::CAMPPlus;
 use crate::models::emotion::EmotionMatrix;
-use crate::models::gpt::{UnifiedVoice, GenerationConfig, generate, generate_with_hidden};
+use crate::models::gpt::{UnifiedVoice, GenerationConfig, generate_with_hidden};
 use crate::models::s2mel::{LengthRegulator, DiffusionTransformer, FlowMatching};
 use crate::models::vocoder::BigVGAN;
 
@@ -55,7 +55,7 @@ impl Default for InferenceConfig {
             repetition_penalty: 1.1,
             max_mel_tokens: 1815,
             flow_steps: 25,
-            cfg_rate: 0.7,
+            cfg_rate: 0.0,
             use_gpu: false,
             verbose_weights: false,
         }
@@ -357,6 +357,16 @@ impl IndexTTS2 {
                 .context("Failed to initialize BigVGAN with random weights")?;
         }
 
+        // Load semantic codec quantizer (MaskGCT) for vq2emb
+        let semantic_codec_path = model_dir.join("maskgct/semantic_codec/model.safetensors");
+        if semantic_codec_path.exists() {
+            self.semantic_codec.load_quantizer_weights(&semantic_codec_path)
+                .with_context(|| format!("Failed to load semantic codec quantizer from {:?}", semantic_codec_path))?;
+            eprintln!("Loaded MaskGCT semantic codec quantizer");
+        } else {
+            eprintln!("WARNING: MaskGCT semantic codec not found at {:?}, vq2emb will use random codebook", semantic_codec_path);
+        }
+
         // Initialize speaker encoder with random weights
         // Note: No CAMPPlus checkpoint available, using random initialization
         tracing::info!("Initializing speaker encoder (CAMPPlus)...");
@@ -444,10 +454,12 @@ impl IndexTTS2 {
             (1, speaker_samples.len()),
             &self.device,
         ).context("Failed to create audio tensor for semantic encoding")?;
-        let semantic_features = self.semantic_encoder.encode(&audio_tensor, None)
+        let s_ref = self.semantic_encoder.encode(&audio_tensor, None)
             .context("Failed to encode semantic features")?;
-        let (_semantic_codes, _) = self.semantic_codec.quantize(&semantic_features)
-            .context("Failed to quantize semantic features")?;
+        // s_ref: [B, T_semantic, 1024] - continuous semantic features from W2V-BERT
+        // Note: Ideally this should go through full RepCodec encoder+VQ, but we use raw features
+        // as an approximation since the full MaskGCT encoder is not yet implemented in Rust.
+        eprintln!("DEBUG: s_ref (semantic features) shape={:?}", s_ref.shape());
 
         // 3. Optional emotion processing
         let _emotion_emb = if let Some(emo_path) = emotion_audio {
@@ -514,21 +526,16 @@ impl IndexTTS2 {
         eprintln!("DEBUG: gpt_layer(latent) shape={:?}, mean={:.4}, var={:.4}",
             latent_projected.shape(), lp_mean, lp_var);
 
-        // Step 2: vq2emb(codes) - embed mel codes and project to 1024
-        // Use GPT's mel_embedding to get 1280-dim, then project to 1024
+        // Step 2: vq2emb(codes) - embed mel codes using semantic codec quantizer codebook
+        // Python: S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
+        //         S_infer = S_infer.transpose(1, 2)
+        // The semantic codec's vq2emb does: codebook lookup (8-dim) → proj_out (8 → 1024)
         let mel_codes_tensor = Tensor::new(&mel_codes[..], &self.device)?
             .unsqueeze(0)?; // Shape: [1, seq_len]
-        let mel_embeddings = self.gpt.embed_mel_codes(&mel_codes_tensor)?;
-        let me_mean: f32 = mel_embeddings.mean_all()?.to_scalar()?;
-        let me_var: f32 = mel_embeddings.var(D::Minus1)?.mean_all()?.to_scalar()?;
-        eprintln!("DEBUG: vq2emb(codes) raw shape={:?}, mean={:.4}, var={:.4}",
-            mel_embeddings.shape(), me_mean, me_var);
-
-        // Project mel embeddings to 1024 (same as latent projection)
-        let code_embeddings = self.length_regulator.project_gpt_embeddings(&mel_embeddings)?;
+        let code_embeddings = self.semantic_codec.vq2emb(&mel_codes_tensor)?;  // → [1, T, 1024]
         let ce_mean: f32 = code_embeddings.mean_all()?.to_scalar()?;
         let ce_var: f32 = code_embeddings.var(D::Minus1)?.mean_all()?.to_scalar()?;
-        eprintln!("DEBUG: vq2emb(codes) projected shape={:?}, mean={:.4}, var={:.4}",
+        eprintln!("DEBUG: vq2emb(codes) shape={:?}, mean={:.4}, var={:.4}",
             code_embeddings.shape(), ce_mean, ce_var);
 
         // Step 3: S_infer = vq2emb(codes) + gpt_layer(latent)
@@ -546,6 +553,18 @@ impl IndexTTS2 {
         let target_len = ((num_mel_codes as f32) * 1.72).round() as usize;
         eprintln!("DEBUG: Length expansion: {} codes → {} frames (ratio 1.72×)", num_mel_codes, target_len);
 
+        // Compute prompt_condition from S_ref (reference audio semantic features)
+        // Python: prompt_condition = length_regulator(S_ref, ylens=ref_target_lengths)
+        let ref_mel_len = n_frames; // number of mel frames from speaker audio
+        let (prompt_condition, _) = self.length_regulator.forward(
+            &s_ref,
+            Some(&[ref_mel_len]),
+        )?;
+        let pc_mean: f32 = prompt_condition.mean_all()?.to_scalar()?;
+        let pc_var: f32 = prompt_condition.var(candle_core::D::Minus1)?.mean_all()?.to_scalar()?;
+        eprintln!("DEBUG: prompt_condition shape={:?}, mean={:.4}, var={:.4}",
+            prompt_condition.shape(), pc_mean, pc_var);
+
         let (content_features, _durations) = self.length_regulator.forward(
             &s_infer,
             Some(&[target_len]),
@@ -556,6 +575,13 @@ impl IndexTTS2 {
         let cf_var: f32 = content_features.var(D::Minus1)?.mean_all()?.to_scalar()?;
         eprintln!("DEBUG: content_features shape={:?}, mean={:.4}, var={:.4}",
             content_features.shape(), cf_mean, cf_var);
+
+        // Concatenate prompt_condition + cond along time dimension (dim=1)
+        // Python: cat_condition = torch.cat([prompt_condition, cond], dim=1)
+        let cat_condition = Tensor::cat(&[&prompt_condition, &content_features], 1)?;
+        let total_len = cat_condition.dim(1)?;
+        eprintln!("DEBUG: cat_condition shape={:?} (ref_mel={} + target={})",
+            cat_condition.shape(), ref_mel_len, target_len);
 
         // Debug: Check speaker embedding
         let spk_mean: f32 = speaker_emb.mean_all()?.to_scalar()?;
@@ -580,64 +606,59 @@ impl IndexTTS2 {
         }
 
         // 6. Flow matching synthesis
-        // Python uses [B, C, T] format at API level, transposes to [B, T, C] internally
-        // Our Rust uses [B, T, C] internally, so we transpose at boundaries
-        let (batch_size, seq_len, _) = content_features.dims3()?;
+        // Python: z = torch.randn([B, 80, T_total])  where T_total = ref_mel_len + target_len
+        let batch_size = 1usize;
 
-        // Create noise in [B, C, T] format (Python format)
-        let noise = self.flow_matching.sample_noise(&[batch_size, 80, seq_len])?;
+        // Create noise in [B, C, T] format: [1, 80, total_len]
+        let noise = self.flow_matching.sample_noise(&[batch_size, 80, total_len])?;
 
-        // NO mel normalization - Python does NOT normalize before flow matching!
-        // The mel spectrogram is already in log-compressed form from mel extraction
-
-        // Calculate prompt_len first (Python uses reference mel length as prompt)
-        // Use a portion of the reference mel as the prompt anchor
-        let speaker_mel_len = speaker_tensor.dim(1)?;
-        let prompt_len = (seq_len / 8).max(5).min(seq_len - 1).min(speaker_mel_len);
-        eprintln!("DEBUG: Flow matching with seq_len={}, speaker_mel_len={}, prompt_len={}",
-            seq_len, speaker_mel_len, prompt_len);
-
-        // Create prompt_x like Python: mostly ZEROS with only first prompt_len frames from ref mel
-        // Python: prompt_x = torch.zeros_like(x)
-        //         prompt_x[..., :prompt_len] = prompt[..., :prompt_len]
+        // Create prompt_x: [B, 80, total_len] with first ref_mel_len frames from speaker mel
         // speaker_tensor is [B, T, C] = [1, n_frames, 80]
-        let prompt_region = speaker_tensor.narrow(1, 0, prompt_len)?;  // [B, prompt_len, 80]
-        let zeros_region = Tensor::zeros(
-            (batch_size, seq_len - prompt_len, 80),
-            DType::F32,
-            &self.device
-        )?;
-        let prompt_x_tc = Tensor::cat(&[prompt_region, zeros_region], 1)?;  // [B, seq_len, 80]
+        let prompt_mel_len = ref_mel_len.min(speaker_tensor.dim(1)?); // Clamp to available mel frames
+        let prompt_region = speaker_tensor.narrow(1, 0, prompt_mel_len)?; // [B, prompt_mel_len, 80]
 
-        // Transpose prompt_x from [B, T, C] to [B, C, T] (Python API format)
-        let prompt_x = prompt_x_tc.transpose(1, 2)?;
-        let prompt_mean: f32 = prompt_x.mean_all()?.to_scalar()?;
-        eprintln!("DEBUG: prompt_x [B,C,T] shape={:?}, mean: {:.4} (should be small, mostly zeros)",
-            prompt_x.shape(), prompt_mean);
+        // If ref_mel_len > available speaker mel frames, pad with zeros
+        let prompt_tc = if prompt_mel_len < ref_mel_len {
+            let padding = Tensor::zeros(
+                (batch_size, ref_mel_len - prompt_mel_len, 80),
+                DType::F32,
+                &self.device,
+            )?;
+            Tensor::cat(&[prompt_region, padding], 1)?
+        } else {
+            prompt_region
+        };
+        // Append zeros for the generation region
+        let gen_zeros = Tensor::zeros(
+            (batch_size, target_len, 80),
+            DType::F32,
+            &self.device,
+        )?;
+        let prompt_x_tc = Tensor::cat(&[prompt_tc, gen_zeros], 1)?; // [B, total_len, 80]
+        let prompt_x = prompt_x_tc.transpose(1, 2)?; // [B, 80, total_len]
+
+        let prompt_len = ref_mel_len;
+        eprintln!("DEBUG: Flow matching: total_len={}, ref_mel_len={}, target_len={}, prompt_len={}",
+            total_len, ref_mel_len, target_len, prompt_len);
 
         // sample() expects [B, C, T] inputs and returns [B, C, T] output
         let mel_spec_ct = self.flow_matching.sample(
             &self.dit,
-            &noise,        // [B, C, T] = [B, 80, T]
-            &prompt_x,     // [B, C, T] = [B, 80, T]
-            &content_features,  // [B, T, C] = [B, T, 512] - unchanged, DiT handles this
-            &speaker_emb,  // [B, C] = [B, 192]
-            prompt_len,
+            &noise,           // [B, 80, total_len]
+            &prompt_x,        // [B, 80, total_len]
+            &cat_condition,   // [B, total_len, 512]
+            &speaker_emb,     // [B, 192]
+            prompt_len,       // = ref_mel_len
         )?;
 
-        // Transpose output from [B, C, T] back to [B, T, C] for vocoder transpose
+        // Transpose output from [B, C, T] back to [B, T, C]
         let mel_spec_full = mel_spec_ct.transpose(1, 2)?;
 
         // CRITICAL: Strip prompt region from output (Python does this!)
-        // Python: vc_target = vc_target[:, :, ref_mel.size(-1):]  # Only keep generated part
-        let mel_spec = if prompt_len > 0 && prompt_len < mel_spec_full.dim(1)? {
-            let gen_len = mel_spec_full.dim(1)? - prompt_len;
-            eprintln!("DEBUG: Stripping prompt region: {} frames, keeping {} generated frames",
-                prompt_len, gen_len);
-            mel_spec_full.narrow(1, prompt_len, gen_len)?
-        } else {
-            mel_spec_full
-        };
+        // Python: vc_target = vc_target[:, :, ref_mel.size(-1):]
+        let mel_spec = mel_spec_full.narrow(1, prompt_len, target_len)?;
+        eprintln!("DEBUG: Stripped prompt ({} frames), keeping {} generated frames",
+            prompt_len, target_len);
 
         // Debug: Check mel spectrogram output
         let mel_mean: f32 = mel_spec.mean_all()?.to_scalar()?;
@@ -649,7 +670,7 @@ impl IndexTTS2 {
 
         // Detailed mel band analysis
         {
-            let mel_2d = mel_spec.squeeze(0)?; // [seq_len, 80]
+            let mel_2d = mel_spec.squeeze(0)?; // [target_len, 80]
             let band_means: Vec<f32> = (0..80).map(|i| {
                 mel_2d.narrow(1, i, 1).unwrap().mean_all().unwrap().to_scalar::<f32>().unwrap()
             }).collect();
@@ -706,16 +727,33 @@ impl IndexTTS2 {
             ..Default::default()
         };
 
-        let mel_codes = generate(&mut self.gpt, &text_ids, Some(conditioning), &gen_config)?;
+        // Generate mel codes AND capture hidden states for S_infer computation
+        let (mel_codes, hidden_states) = generate_with_hidden(
+            &mut self.gpt,
+            &text_ids,
+            Some(conditioning),
+            &gen_config,
+        )?;
 
-        // Length regulation
+        // Compute S_infer = vq2emb(codes) + gpt_layer(latent) (same as main inference path)
+        // Step 1: gpt_layer(latent) - project hidden states: 1280 → 1024
+        let latent_projected = self.length_regulator.project_gpt_embeddings(&hidden_states)?;
+
+        // Step 2: vq2emb(codes) - embed mel codes using semantic codec quantizer codebook
         let mel_codes_tensor = Tensor::new(&mel_codes[..], &self.device)?
-            .unsqueeze(0)?
-            .to_dtype(DType::F32)?;
+            .unsqueeze(0)?; // Shape: [1, seq_len]
+        let code_embeddings = self.semantic_codec.vq2emb(&mel_codes_tensor)?;  // → [1, T, 1024]
+
+        // Step 3: S_infer = vq2emb(codes) + gpt_layer(latent)
+        let s_infer = (&code_embeddings + &latent_projected)?;
+
+        // Step 4: Process through length regulator with temporal expansion
+        let num_mel_codes = s_infer.dim(1)?;
+        let target_len = ((num_mel_codes as f32) * 1.72).round() as usize;
 
         let (content_features, _) = self.length_regulator.forward(
-            &mel_codes_tensor.unsqueeze(2)?,
-            None,
+            &s_infer,
+            Some(&[target_len]),
         )?;
 
         // Flow matching
