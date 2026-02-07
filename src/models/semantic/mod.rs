@@ -5,6 +5,8 @@
 
 mod wav2vec_bert;
 mod codec;
+mod vocos;
 
 pub use wav2vec_bert::SemanticEncoder;
 pub use codec::SemanticCodec;
+pub use vocos::VocosBackbone;

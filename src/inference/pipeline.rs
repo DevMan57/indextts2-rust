@@ -454,12 +454,23 @@ impl IndexTTS2 {
             (1, speaker_samples.len()),
             &self.device,
         ).context("Failed to create audio tensor for semantic encoding")?;
-        let s_ref = self.semantic_encoder.encode(&audio_tensor, None)
+        let semantic_features = self.semantic_encoder.encode(&audio_tensor, None)
             .context("Failed to encode semantic features")?;
-        // s_ref: [B, T_semantic, 1024] - continuous semantic features from W2V-BERT
-        // Note: Ideally this should go through full RepCodec encoder+VQ, but we use raw features
-        // as an approximation since the full MaskGCT encoder is not yet implemented in Rust.
-        eprintln!("DEBUG: s_ref (semantic features) shape={:?}", s_ref.shape());
+        // semantic_features: [B, T_semantic, 1024] - raw W2V-BERT hidden layer 17 features
+
+        eprintln!("DEBUG: raw semantic features shape={:?}", semantic_features.shape());
+
+        // Run through RepCodec encoder (VocosBackbone) + quantizer for proper S_ref
+        // Python: _, S_ref = semantic_codec.quantize(feat)
+        // This runs: feat -> VocosBackbone(12 ConvNeXt blocks) -> in_project -> VQ -> out_project
+        let (s_ref, _semantic_codes) = self.semantic_codec.encode_and_quantize(&semantic_features)
+            .context("Failed to encode and quantize semantic features through RepCodec")?;
+        // s_ref: [B, T_semantic, 1024] - quantized embeddings in RepCodec's output space
+
+        eprintln!("DEBUG: s_ref (RepCodec encoded+quantized) shape={:?}", s_ref.shape());
+        let sr_mean: f32 = s_ref.mean_all()?.to_scalar()?;
+        let sr_var: f32 = s_ref.var(candle_core::D::Minus1)?.mean_all()?.to_scalar()?;
+        eprintln!("DEBUG: s_ref mean={:.4}, var={:.4}", sr_mean, sr_var);
 
         // 3. Optional emotion processing
         let _emotion_emb = if let Some(emo_path) = emotion_audio {
