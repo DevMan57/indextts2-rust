@@ -202,12 +202,18 @@ impl ConvGNBlock {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, debug_idx: usize) -> Result<Tensor> {
         // x: (batch, channels, seq)
         let padding = self.kernel_size / 2;
         let x = x.conv1d(&self.conv_weight, padding, 1, 1, 1)?;
         let bias = self.conv_bias.unsqueeze(0)?.unsqueeze(2)?;
         let x = x.broadcast_add(&bias)?;
+
+        if debug_idx == 0 {
+            let m: f32 = x.mean_all()?.to_scalar()?;
+            let v: f32 = x.var(candle_core::D::Minus1)?.mean_all()?.to_scalar()?;
+            eprintln!("DEBUG ConvGN: after conv+bias: mean={:.6}, var={:.6}", m, v);
+        }
 
         // GroupNorm: normalize across channel groups for each spatial position
         // When num_groups=1, this normalizes across ALL channels (like LayerNorm on channels)
@@ -241,8 +247,22 @@ impl ConvGNBlock {
         let x = x.broadcast_mul(&gn_weight)?;
         let x = x.broadcast_add(&gn_bias)?;
 
+        if debug_idx == 0 {
+            let m: f32 = x.mean_all()?.to_scalar()?;
+            let v: f32 = x.var(candle_core::D::Minus1)?.mean_all()?.to_scalar()?;
+            eprintln!("DEBUG ConvGN: after groupnorm: mean={:.6}, var={:.6}", m, v);
+        }
+
         // Mish activation: x * tanh(softplus(x))
-        mish(&x)
+        let x = mish(&x)?;
+
+        if debug_idx == 0 {
+            let m: f32 = x.mean_all()?.to_scalar()?;
+            let v: f32 = x.var(candle_core::D::Minus1)?.mean_all()?.to_scalar()?;
+            eprintln!("DEBUG ConvGN: after mish: mean={:.6}, var={:.6}", m, v);
+        }
+
+        Ok(x)
     }
 }
 
@@ -453,6 +473,12 @@ impl LengthRegulator {
         // Transpose for conv1d: (batch, seq, channels) -> (batch, channels, seq)
         let mut x = x.transpose(1, 2)?;
 
+        {
+            let m: f32 = x.mean_all()?.to_scalar()?;
+            let v: f32 = x.var(candle_core::D::Minus1)?.mean_all()?.to_scalar()?;
+            eprintln!("DEBUG LR: after content_in_proj: mean={:.6}, var={:.6}", m, v);
+        }
+
         // Step 2: INTERPOLATE FIRST to target length (before conv blocks!)
         // Python: x = F.interpolate(x.transpose(1, 2).contiguous(), size=ylens.max(), mode='nearest')
         let (batch_size, _channels, seq_len) = x.dims3()?;
@@ -463,9 +489,18 @@ impl LengthRegulator {
             x = self.interpolate_nearest(&x, target_len)?;
         }
 
+        {
+            let m: f32 = x.mean_all()?.to_scalar()?;
+            let v: f32 = x.var(candle_core::D::Minus1)?.mean_all()?.to_scalar()?;
+            eprintln!("DEBUG LR: after interpolation: mean={:.6}, var={:.6}", m, v);
+        }
+
         // Step 3: Apply conv blocks on EXPANDED sequence
-        for block in &self.conv_blocks {
-            x = block.forward(&x)?;
+        for (idx, block) in self.conv_blocks.iter().enumerate() {
+            x = block.forward(&x, idx)?;
+            let m: f32 = x.mean_all()?.to_scalar()?;
+            let v: f32 = x.var(candle_core::D::Minus1)?.mean_all()?.to_scalar()?;
+            eprintln!("DEBUG LR: after conv_block {}: mean={:.6}, var={:.6}", idx, m, v);
         }
 
         // Step 4: Final conv
@@ -473,6 +508,12 @@ impl LengthRegulator {
             x = x.conv1d(w, 0, 1, 1, 1)?; // kernel_size=1, no padding
             let bias = b.unsqueeze(0)?.unsqueeze(2)?;
             x = x.broadcast_add(&bias)?;
+        }
+
+        {
+            let m: f32 = x.mean_all()?.to_scalar()?;
+            let v: f32 = x.var(candle_core::D::Minus1)?.mean_all()?.to_scalar()?;
+            eprintln!("DEBUG LR: after final_conv: mean={:.6}, var={:.6}", m, v);
         }
 
         // Transpose back: (batch, channels, seq) -> (batch, seq, channels)
@@ -502,7 +543,8 @@ impl LengthRegulator {
             for c in 0..channels {
                 for t in 0..target_len {
                     // Nearest neighbor: find source index
-                    let src_t = ((t as f32 + 0.5) * (seq as f32) / (target_len as f32)).floor() as usize;
+                    // PyTorch F.interpolate(mode='nearest'): src_t = floor(t * src_len / dst_len)
+                    let src_t = ((t as f32) * (seq as f32) / (target_len as f32)).floor() as usize;
                     let src_t = src_t.min(seq - 1);
 
                     let src_idx = b * channels * seq + c * seq + src_t;

@@ -1,5 +1,5 @@
 dataset:
-    bpe_model: bpe.model
+    bpe_model: tokenizer_english.json
     sample_rate: 24000
     squeeze: false
     mel:
@@ -107,11 +107,13 @@ s2mel:
         p_dropout: 0.2
         style_condition: true
 
-gpt_checkpoint: gpt.pth
-w2v_stat: wav2vec2bert_stats.pt
-s2mel_checkpoint: s2mel.pth
-emo_matrix: feat2.pt 
-spk_matrix: feat1.pt
+gpt_checkpoint: gpt.safetensors
+w2v_stat: wav2vec2bert_stats.safetensors
+w2v_model: w2v-bert-2.0/model.safetensors
+s2mel_checkpoint: s2mel.safetensors
+emo_matrix: emotion_matrix.safetensors
+spk_matrix: speaker_matrix.safetensors
+bigvgan_checkpoint: bigvgan.safetensors
 emo_num: [3, 17, 2, 8, 4, 5, 10, 24]
 qwen_emo_path: qwen0.6bemo4-merge/ 
 vocoder:

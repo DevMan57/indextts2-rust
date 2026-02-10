@@ -430,6 +430,8 @@ struct ConvolutionModule {
     pointwise_conv1: Linear,
     depthwise_conv_weight: Tensor,
     depthwise_conv_bias: Tensor,
+    /// Normalization after depthwise conv (LayerNorm loaded from checkpoint's conv_module.norm)
+    norm: LayerNorm,
     pointwise_conv2: Linear,
     kernel_size: usize,
 }
@@ -442,6 +444,8 @@ impl ConvolutionModule {
         // Depthwise conv
         let depthwise_conv_weight = vb.get((dim, 1, kernel_size), "depthwise_conv.weight")?;
         let depthwise_conv_bias = vb.get((dim,), "depthwise_conv.bias")?;
+        // Norm after depthwise conv
+        let norm = candle_nn::layer_norm(dim, 1e-5, vb.pp("norm"))?;
         // Pointwise conv back to dim
         let pointwise_conv2 = candle_nn::linear(dim, dim, vb.pp("pointwise_conv2"))?;
 
@@ -450,6 +454,7 @@ impl ConvolutionModule {
             pointwise_conv1,
             depthwise_conv_weight,
             depthwise_conv_bias,
+            norm,
             pointwise_conv2,
             kernel_size,
         })
@@ -513,6 +518,15 @@ impl ConvolutionModule {
             }
         };
 
+        // Norm after depthwise conv (checkpoint keys: {prefix}.norm.weight, {prefix}.norm.bias)
+        let norm = load_layer_norm_from_tensors(
+            tensors,
+            &format!("{}.norm.weight", prefix),
+            &format!("{}.norm.bias", prefix),
+            dim,
+            device,
+        )?;
+
         // Pointwise conv2
         let pw2_key = format!("{}.pointwise_conv2.weight", prefix);
         let pointwise_conv2 = if let Some(weight) = tensors.get(&pw2_key) {
@@ -531,6 +545,7 @@ impl ConvolutionModule {
             pointwise_conv1,
             depthwise_conv_weight,
             depthwise_conv_bias,
+            norm,
             pointwise_conv2,
             kernel_size,
         })
@@ -548,6 +563,10 @@ impl ConvolutionModule {
         let depthwise_conv_weight = Tensor::randn(0.0f32, 0.02, (dim, 1, kernel_size), device)?;
         let depthwise_conv_bias = Tensor::zeros((dim,), DType::F32, device)?;
 
+        let norm_weight = Tensor::ones((dim,), DType::F32, device)?;
+        let norm_bias = Tensor::zeros((dim,), DType::F32, device)?;
+        let norm = LayerNorm::new(norm_weight, norm_bias, 1e-5);
+
         let w2 = Tensor::randn(0.0f32, 0.02, (dim, dim), device)?;
         let b2 = Tensor::zeros((dim,), DType::F32, device)?;
         let pointwise_conv2 = Linear::new(w2, Some(b2));
@@ -557,6 +576,7 @@ impl ConvolutionModule {
             pointwise_conv1,
             depthwise_conv_weight,
             depthwise_conv_bias,
+            norm,
             pointwise_conv2,
             kernel_size,
         })
@@ -583,7 +603,11 @@ impl ConvolutionModule {
         let bias = self.depthwise_conv_bias.unsqueeze(0)?.unsqueeze(2)?;
         let x = x.broadcast_add(&bias)?;
 
-        // Batch norm would go here, using swish for simplicity
+        // Apply norm (LayerNorm needs channels-last format)
+        let x = x.transpose(1, 2)?;  // (batch, channels, seq) -> (batch, seq, channels)
+        let x = self.norm.forward(&x)?;
+        let x = x.transpose(1, 2)?;  // (batch, seq, channels) -> (batch, channels, seq)
+
         let x = swish(&x)?;
 
         // Transpose back to (batch, seq, channels)
@@ -875,7 +899,7 @@ impl ConformerEncoder {
     }
 
     /// Load from GPT checkpoint format (conditioning_encoder.*)
-    fn load_from_gpt_tensors(&mut self, tensors: &HashMap<String, Tensor>) -> Result<()> {
+    pub fn load_from_gpt_tensors(&mut self, tensors: &HashMap<String, Tensor>) -> Result<()> {
         // Input projection - GPT uses a conv-based embed layer instead of linear
         // We'll use random weights for input_proj since the architecture differs
         let w = Tensor::randn(

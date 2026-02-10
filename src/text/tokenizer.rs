@@ -219,6 +219,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_hello_tokenization() {
+        let normalizer = TextNormalizer::new(false);
+        // Try to load the real tokenizer if it exists, otherwise skip
+        if std::path::Path::new("checkpoints/tokenizer_english.json").exists() {
+            let tokenizer = TextTokenizer::load("checkpoints/tokenizer_english.json", normalizer).unwrap();
+            let ids = tokenizer.encode("Hello").unwrap();
+            let tokens = tokenizer.convert_ids_to_tokens(&ids);
+            println!("HELLO IDS: {:?}", ids);
+            println!("HELLO TOKENS: {:?}", tokens);
+        }
+    }
+
+    #[test]
     fn test_cjk_tokenization() {
         let result = tokenize_by_cjk_char("你好world");
         // CJK characters are separated by spaces

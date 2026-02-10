@@ -86,6 +86,14 @@ accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 name = "indextts2"
 path = "src/main.rs"
 
+[[bin]]
+name = "diagnose_weights"
+path = "src/bin/diagnose_weights.rs"
+
+[[bin]]
+name = "test_length_regulator"
+path = "src/bin/test_length_regulator.rs"
+
 [[example]]
 name = "basic_inference"
 path = "examples/basic_inference.rs"

@@ -269,13 +269,16 @@ pub fn generate(
     // === PREFILL PHASE ===
     // Process conditioning through model first (if any)
     let mut position = 0;
-    if let Some(_cond) = conditioning {
-        // Process conditioning tokens (they use text embedding space)
-        // The conditioning is already in embedding space from process_conditioning
-        // For proper prefill, we'd need to handle this differently
-        // For now, we skip conditioning prefill and just advance position
+    if let Some(cond) = conditioning {
+        // Process conditioning embeddings: (batch, cond_len, dim)
+        let cond_len = cond.dim(1)?;
+        for i in 0..cond_len {
+            let emb = cond.i((.., i..i + 1, ..))?;
+            // Process as text token positionally, but use embedding directly
+            let _logits = model.forward_one_embedding(&emb, i, false)?;
+        }
         position = cond_len;
-        eprintln!("DEBUG generation: Skipping conditioning prefill, advancing position by {}", cond_len);
+        eprintln!("DEBUG generation: Prefilled {} conditioning frames", cond_len);
     }
 
     // Prefill: Process all text tokens to fill the KV cache
@@ -391,13 +394,16 @@ pub fn generate_with_hidden(
     let text_len = text_ids.dim(1)?;
     let cond_len = conditioning.map(|c| c.dim(1).unwrap_or(0)).unwrap_or(0);
 
-    eprintln!("DEBUG generate_with_hidden: text_len={}, cond_len={}, max_length={}",
-        text_len, cond_len, config.max_length);
-
     // === PREFILL PHASE ===
     let mut position = 0;
-    if conditioning.is_some() {
+    if let Some(cond) = conditioning {
+        let cond_len = cond.dim(1)?;
+        for i in 0..cond_len {
+            let emb = cond.i((.., i..i + 1, ..))?;
+            let _logits = model.forward_one_embedding(&emb, i, false)?;
+        }
         position = cond_len;
+        eprintln!("DEBUG generate_with_hidden: Prefilled {} conditioning frames", cond_len);
     }
 
     // Prefill text tokens
@@ -484,7 +490,12 @@ pub fn generate_greedy(
 
     // === PREFILL PHASE ===
     let mut position = 0;
-    if conditioning.is_some() {
+    if let Some(cond) = conditioning {
+        let cond_len = cond.dim(1)?;
+        for i in 0..cond_len {
+            let emb = cond.i((.., i..i + 1, ..))?;
+            let _logits = model.forward_one_embedding(&emb, i, false)?;
+        }
         position = cond_len;
     }
 

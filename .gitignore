@@ -21,6 +21,11 @@ nul
 /checkpoints/*.bin
 /checkpoints/*.onnx
 /checkpoints/tokenizer.json
+/checkpoints/.cache/
+/checkpoints/bigvgan-v2/
+/checkpoints/maskgct/
+/checkpoints/qwen0.6bemo4-merge/
+/checkpoints/w2v-bert-2.0/
 !/checkpoints/.gitkeep
 
 # Audio files

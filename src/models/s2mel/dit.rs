@@ -849,13 +849,19 @@ impl DiTBlock {
         Ok(Self { norm1, attn, norm2, ff, skip_in_linear })
     }
 
-    fn forward(&self, x: &Tensor, cond: &Tensor, _skip: Option<&Tensor>) -> Result<Tensor> {
-        // skip_in_linear usage is deferred to a later phase
-        // For now, just keep the existing forward logic unchanged
+    fn forward(&self, x: &Tensor, cond: &Tensor, skip: Option<&Tensor>) -> Result<Tensor> {
+        // Apply skip_in_linear if we have both the projection and skip features
+        // Python: x = self.skip_in_linear(torch.cat([x, skip_in_x], dim=-1))
+        let x = if let (Some(ref proj), Some(skip_tensor)) = (&self.skip_in_linear, skip) {
+            let x_cat = Tensor::cat(&[x, skip_tensor], candle_core::D::Minus1)?; // [B, T, 1024]
+            proj.forward(&x_cat)? // [B, T, 512]
+        } else {
+            x.clone()
+        };
 
         // Self-attention with AdaLN
         let residual = x.clone();
-        let x_normed = self.norm1.forward(x, cond)?;
+        let x_normed = self.norm1.forward(&x, cond)?;
         let x_attn = self.attn.forward(&x_normed)?;
         let x = (residual + x_attn)?;
 
@@ -1661,14 +1667,17 @@ impl DiffusionTransformer {
 
         // 9. Second half of transformer blocks (decoder) with skip connections
         for (i, block) in self.blocks.iter().skip(mid_point).enumerate() {
-            if self.config.uvit_skip_connection && i < skip_features.len() {
-                // Add skip connection from encoder
+            let skip_tensor = if self.config.uvit_skip_connection && i < skip_features.len() {
                 let skip_idx = skip_features.len() - 1 - i;
                 if skip_idx < skip_features.len() {
-                    h = (h + &skip_features[skip_idx])?;
+                    Some(&skip_features[skip_idx])
+                } else {
+                    None
                 }
-            }
-            h = block.forward(&h, &ada_cond, None)?;
+            } else {
+                None
+            };
+            h = block.forward(&h, &ada_cond, skip_tensor)?;
             if should_print {
                 let h_rms: f32 = h.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt();
                 block_rms.push((format!("dec{}", i), h_rms));

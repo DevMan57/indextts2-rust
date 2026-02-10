@@ -112,6 +112,12 @@ pub struct DiTWeights {
     pub transformer_layers: Vec<DiTLayerWeights>,
 }
 
+/// AdaLayerNorm weights (norm + projection for scale/shift)
+pub struct AdaLayerNormWeights {
+    pub norm: LayerNorm,
+    pub project_weight: Linear,
+}
+
 /// DiT transformer layer weights
 pub struct DiTLayerWeights {
     pub wqkv: Linear,
@@ -119,8 +125,9 @@ pub struct DiTLayerWeights {
     pub w1: Linear,  // FFN first layer (fused w1 and w3 for SwiGLU)
     pub w2: Linear,  // FFN second layer
     pub w3: Option<Linear>,  // Optional if fused with w1
-    pub attn_norm: Option<LayerNorm>,
-    pub ffn_norm: Option<LayerNorm>,
+    pub attn_norm: Option<AdaLayerNormWeights>,
+    pub ffn_norm: Option<AdaLayerNormWeights>,
+    pub skip_in_linear: Option<Linear>,
 }
 
 impl DiTWeights {
@@ -197,11 +204,15 @@ impl DiTWeights {
 
 impl DiTLayerWeights {
     /// Load a single transformer layer
+    ///
+    /// AdaLayerNorm keys: {prefix}.attention_norm.norm.weight,
+    ///   {prefix}.attention_norm.project_layer.weight/bias
+    /// Skip connection: {prefix}.skip_in_linear.weight/bias
     fn load(
         tensors: &HashMap<String, Tensor>,
         layer_idx: usize,
-        _hidden_dim: usize,
-        _device: &Device,
+        hidden_dim: usize,
+        device: &Device,
     ) -> Result<Self> {
         let prefix = format!("cfm.estimator.transformer.layers.{}", layer_idx);
 
@@ -239,9 +250,42 @@ impl DiTLayerWeights {
             .get(&format!("{}.feed_forward.w3.weight", prefix))
             .map(|w| Linear::new(w.t().unwrap().contiguous().unwrap(), None));
 
-        // Layer norms (may not be present in all architectures)
-        let attn_norm = None;
-        let ffn_norm = None;
+        // AdaLayerNorm for attention: norm.weight + project_layer.weight/bias
+        let attn_norm = {
+            let norm_key = format!("{}.attention_norm.norm.weight", prefix);
+            let proj_key = format!("{}.attention_norm.project_layer.weight", prefix);
+            let proj_bias_key = format!("{}.attention_norm.project_layer.bias", prefix);
+            if tensors.contains_key(&norm_key) && tensors.contains_key(&proj_key) {
+                let norm = load_layer_norm(tensors, &norm_key, None, 1e-5, hidden_dim, device)?;
+                let project_weight = load_linear(tensors, &proj_key, Some(&proj_bias_key), false)?;
+                Some(AdaLayerNormWeights { norm, project_weight })
+            } else {
+                None
+            }
+        };
+
+        // AdaLayerNorm for FFN: norm.weight + project_layer.weight/bias
+        let ffn_norm = {
+            let norm_key = format!("{}.ffn_norm.norm.weight", prefix);
+            let proj_key = format!("{}.ffn_norm.project_layer.weight", prefix);
+            let proj_bias_key = format!("{}.ffn_norm.project_layer.bias", prefix);
+            if tensors.contains_key(&norm_key) && tensors.contains_key(&proj_key) {
+                let norm = load_layer_norm(tensors, &norm_key, None, 1e-5, hidden_dim, device)?;
+                let project_weight = load_linear(tensors, &proj_key, Some(&proj_bias_key), false)?;
+                Some(AdaLayerNormWeights { norm, project_weight })
+            } else {
+                None
+            }
+        };
+
+        // UViT skip connection linear
+        let skip_in_key = format!("{}.skip_in_linear.weight", prefix);
+        let skip_in_bias_key = format!("{}.skip_in_linear.bias", prefix);
+        let skip_in_linear = if tensors.contains_key(&skip_in_key) {
+            Some(load_linear(tensors, &skip_in_key, Some(&skip_in_bias_key), false)?)
+        } else {
+            None
+        };
 
         Ok(Self {
             wqkv,
@@ -251,6 +295,7 @@ impl DiTLayerWeights {
             w3,
             attn_norm,
             ffn_norm,
+            skip_in_linear,
         })
     }
 }

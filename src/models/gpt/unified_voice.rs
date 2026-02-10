@@ -483,9 +483,9 @@ impl UnifiedVoice {
             &self.device,
         )?;
 
-        // TODO: Load actual conformer weights from tensors
+        // Load actual conformer weights from tensors
         // Keys: conditioning_encoder.encoders.{n}.*
-        conformer.initialize_random()?;
+        conformer.load_from_gpt_tensors(tensors)?;
         self.conformer = Some(conformer);
         Ok(())
     }
@@ -736,15 +736,54 @@ impl UnifiedVoice {
         } else {
             self.embed_text(&flat_id)?
         };
-        let mut hidden = hidden.reshape((batch_size, 1, self.config.model_dim))?;
+        let hidden = hidden.reshape((batch_size, 1, self.config.model_dim))?;
+
+        self.forward_one_embedding(&hidden, position, is_mel)
+    }
+
+    /// Forward pass for generation using pre-computed embeddings
+    pub fn forward_one_embedding(
+        &mut self,
+        embedding: &Tensor,
+        position: usize,
+        is_mel: bool,
+    ) -> Result<Tensor> {
+        let (logits, _) = self.forward_one_embedding_with_hidden(embedding, position, is_mel)?;
+        Ok(logits)
+    }
+
+    /// Forward pass for generation using pre-computed embeddings, returning logits and hidden states
+    pub fn forward_one_embedding_with_hidden(
+        &mut self,
+        embedding: &Tensor,
+        position: usize,
+        is_mel: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        if !self.weights_loaded {
+            let batch = embedding.dim(0)?;
+            let logits = Tensor::zeros(
+                (batch, self.config.number_mel_codes),
+                DType::F32,
+                &self.device,
+            )?;
+            return Ok((logits, embedding.clone()));
+        }
+
+        // Ensure cache is initialized
+        if self.kv_cache.is_none() {
+            self.init_cache();
+        }
+
+        let (batch_size, seq_len, _) = embedding.dims3()?;
+        if seq_len != 1 {
+            anyhow::bail!("forward_one_embedding only supports seq_len=1, got {}", seq_len);
+        }
+
+        let mut hidden = embedding.clone();
 
         // Add positional embedding
-        // The positional embeddings are concatenated: [text_pos (602), mel_pos (1818)]
-        // For text tokens, use position directly (0 to max_text_tokens)
-        // For mel tokens, use position + text_pos_size (602) to access mel_pos_embedding
-        let text_pos_size = self.config.max_text_tokens + 2; // 602
+        let text_pos_size = self.config.max_text_tokens + 2;
         let pos_index = if is_mel {
-            // Mel tokens use mel_pos_embedding, which starts at index text_pos_size
             text_pos_size + position
         } else {
             position
@@ -766,19 +805,24 @@ impl UnifiedVoice {
             hidden = ln.forward(&hidden)?;
         }
 
+        // Save hidden states before projection
+        let hidden_states = hidden.clone();
+
         // Squeeze out sequence dimension and project to logits
         let hidden = hidden.squeeze(1)?;
-        if let Some(ref lm_head) = self.lm_head {
-            lm_head.forward(&hidden).map_err(Into::into)
+        let logits = if let Some(ref lm_head) = self.lm_head {
+            lm_head.forward(&hidden)?
         } else {
             Tensor::zeros(
                 (batch_size, self.config.number_mel_codes),
                 DType::F32,
                 &self.device,
-            )
-            .map_err(Into::into)
-        }
+            )?
+        };
+
+        Ok((logits, hidden_states))
     }
+
 
     /// Get model dimension
     pub fn model_dim(&self) -> usize {
@@ -851,48 +895,9 @@ impl UnifiedVoice {
         } else {
             self.embed_text(&flat_id)?
         };
-        let mut hidden = hidden.reshape((batch_size, 1, self.config.model_dim))?;
+        let hidden = hidden.reshape((batch_size, 1, self.config.model_dim))?;
 
-        // Add positional embedding
-        let text_pos_size = self.config.max_text_tokens + 2;
-        let pos_index = if is_mel {
-            text_pos_size + position
-        } else {
-            position
-        };
-        let pos_emb = self.embed_pos(1, pos_index)?;
-        let pos_emb = pos_emb.unsqueeze(0)?.broadcast_as(hidden.shape())?;
-        hidden = (hidden + pos_emb)?;
-
-        // Process through decoder layers with KV cache
-        let cache = self.kv_cache.as_mut().unwrap();
-        for (i, layer) in self.decoder_layers.iter().enumerate() {
-            let layer_cache = cache.get_layer_cache_mut(i)
-                .ok_or_else(|| anyhow::anyhow!("Layer cache {} not found", i))?;
-            hidden = layer.forward(&hidden, layer_cache, true)?;
-        }
-
-        // Final layer norm
-        if let Some(ref ln) = self.final_layer_norm {
-            hidden = ln.forward(&hidden)?;
-        }
-
-        // Save hidden states before projection (shape: batch, 1, model_dim)
-        let hidden_states = hidden.clone();
-
-        // Squeeze out sequence dimension and project to logits
-        let hidden = hidden.squeeze(1)?;
-        let logits = if let Some(ref lm_head) = self.lm_head {
-            lm_head.forward(&hidden)?
-        } else {
-            Tensor::zeros(
-                (batch_size, self.config.number_mel_codes),
-                DType::F32,
-                &self.device,
-            )?
-        };
-
-        Ok((logits, hidden_states))
+        self.forward_one_embedding_with_hidden(&hidden, position, is_mel)
     }
 }
 
