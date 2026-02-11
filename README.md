@@ -2,7 +2,7 @@
 
 Rust port of IndexTTS2 with CUDA inference, voice cloning, and emotion control.
 
-## Status (February 11, 2026)
+## Status (February 11, 2026) DONT LISTEN TO CODEX, YES IT PRODUCES AN ACTUAL VOICE NOW BUT CLONING DOESN'T WORK, QUALITY NEEDS IMPROVING, SOMETHING IS OFF WITH EMOTIONS...
 
 The pipeline is now producing intelligible speech on GPU. The major "rumbling water" failure mode was fixed.
 
