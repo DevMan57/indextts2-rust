@@ -61,6 +61,14 @@ enum Commands {
         #[arg(long)]
         emotion_vector: Option<String>,
 
+        /// Derive emotion vector from text via Qwen
+        #[arg(long)]
+        use_emo_text: bool,
+
+        /// Text to analyze for emotion (defaults to main text)
+        #[arg(long)]
+        emo_text: Option<String>,
+
         /// Path to model config file
         #[arg(short, long, default_value = "checkpoints/config.yaml")]
         config: PathBuf,
@@ -80,6 +88,30 @@ enum Commands {
         /// Top-p (nucleus) sampling (1.0 = disabled)
         #[arg(long, default_value = "0.95")]
         top_p: f32,
+
+        /// Repetition penalty (higher discourages loops)
+        #[arg(long, default_value = "1.1")]
+        repetition_penalty: f32,
+
+        /// Maximum mel tokens generated before fallback/stop
+        #[arg(long, default_value = "1815")]
+        max_mel_tokens: usize,
+
+        /// Number of flow-matching denoising steps
+        #[arg(long, default_value = "25")]
+        flow_steps: usize,
+
+        /// Flow-matching classifier-free guidance rate
+        #[arg(long = "flow-cfg-rate", default_value = "0.7")]
+        flow_cfg_rate: f32,
+
+        /// Apply a post-vocoder high-pass filter to reduce low-frequency rumble
+        #[arg(long)]
+        de_rumble: bool,
+
+        /// High-pass cutoff in Hz used when --de-rumble is enabled
+        #[arg(long, default_value = "140.0")]
+        de_rumble_cutoff_hz: f32,
 
         /// Enable streaming output (play as generated)
         #[arg(long)]
@@ -116,6 +148,19 @@ enum Commands {
     },
 }
 
+fn parse_emotion_vector(raw: &str) -> Result<Vec<f32>> {
+    let parts: Vec<&str> = raw.split(',').collect();
+    if parts.len() != 8 {
+        anyhow::bail!("Emotion vector must have 8 comma-separated values");
+    }
+    let mut vec = Vec::with_capacity(8);
+    for p in parts {
+        let v: f32 = p.trim().parse()
+            .with_context(|| format!("Invalid emotion value: '{}'", p))?;
+        vec.push(v);
+    }
+    Ok(vec)
+}
 fn setup_logging(verbose: bool) {
     let level = if verbose { Level::DEBUG } else { Level::INFO };
     let subscriber = FmtSubscriber::builder()
@@ -150,13 +195,21 @@ fn main() -> Result<()> {
             speaker,
             output,
             emotion_audio,
-            emotion_alpha: _,
-            emotion_vector: _,
+            emotion_alpha,
+            emotion_vector,
+            use_emo_text,
+            emo_text,
             config,
             max_tokens: _,
             temperature,
             top_k,
             top_p,
+            repetition_penalty,
+            max_mel_tokens,
+            flow_steps,
+            flow_cfg_rate,
+            de_rumble,
+            de_rumble_cutoff_hz,
             stream: _,
         } => {
             // Validate inputs
@@ -168,12 +221,27 @@ fn main() -> Result<()> {
             let start = Instant::now();
 
             // Create inference config
+            let emotion_vector = match emotion_vector.as_deref() {
+                Some(raw) => Some(parse_emotion_vector(raw)?),
+                None => None,
+            };
+
             let inference_config = InferenceConfig {
                 temperature,
                 top_k,
                 top_p,
+                repetition_penalty,
+                max_mel_tokens,
                 use_gpu: !cli.cpu,
                 verbose_weights: cli.verbose,
+                flow_steps,
+                cfg_rate: flow_cfg_rate,
+                de_rumble,
+                de_rumble_cutoff_hz,
+                emotion_alpha,
+                emotion_vector,
+                use_emo_text,
+                emotion_text: emo_text,
                 ..Default::default()
             };
 
@@ -196,6 +264,13 @@ fn main() -> Result<()> {
             info!("Text: {} ({} chars)", &text[..text.len().min(50)], text.len());
             info!("Speaker: {:?}", speaker);
             info!("Output: {:?}", output);
+            info!("Flow: steps={}, cfg_rate={:.3}", flow_steps, flow_cfg_rate);
+            if de_rumble {
+                info!(
+                    "Post-filter: de-rumble enabled (high-pass {:.1} Hz)",
+                    de_rumble_cutoff_hz
+                );
+            }
 
             // Perform inference
             let pb = create_progress_bar("Generating speech...");
@@ -229,14 +304,14 @@ fn main() -> Result<()> {
         Commands::Serve { port, config: _ } => {
             info!("Starting TTS server on port {}", port);
             // TODO: Implement HTTP/WebSocket server
-            eprintln!("🚧 Server mode not yet implemented.");
+            eprintln!("Server mode not yet implemented.");
             Ok(())
         }
 
         Commands::Download { version, output } => {
             info!("Downloading IndexTTS{} models to {:?}", version, output);
             // TODO: Implement model download from HuggingFace
-            eprintln!("🚧 Model download not yet implemented.");
+            eprintln!("Model download not yet implemented.");
             eprintln!("For now, use: hf download IndexTeam/IndexTTS-2 --local-dir=checkpoints");
             Ok(())
         }

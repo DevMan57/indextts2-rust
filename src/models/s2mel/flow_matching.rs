@@ -7,6 +7,7 @@
 
 use anyhow::Result;
 use candle_core::{Device, DType, Tensor};
+use crate::utils::parity_dump;
 
 use super::dit::DiffusionTransformer;
 
@@ -185,6 +186,14 @@ impl FlowMatching {
         // [B, C, T] format: time is dimension 2
         let time_len = noise.dim(2)?;
 
+        parity_dump::dump_tensor_f32("rust_dit_input_noise", noise);
+        parity_dump::dump_tensor_f32("rust_dit_input_prompt_x", prompt_x);
+        parity_dump::dump_tensor_f32("rust_dit_input_cond", cond);
+        parity_dump::dump_tensor_f32("rust_dit_input_style", style);
+        parity_dump::dump_usize("rust_dit_prompt_len", prompt_len);
+        parity_dump::dump_usize("rust_dit_num_steps", num_steps);
+        parity_dump::dump_f32("rust_dit_cfg_rate", self.config.cfg_rate);
+
         let mut x = noise.clone();
 
         // Zero out prompt region initially (Python: x[..., :prompt_len] = 0)
@@ -200,6 +209,11 @@ impl FlowMatching {
         for step in 0..num_steps {
             let t = step as f32 / num_steps as f32;
             x = self.euler_step(model, &x, prompt_x, t, dt, cond, style)?;
+
+            if step < 3 {
+                let name = format!("rust_dit_step_{step:02}");
+                parity_dump::dump_tensor_f32(&name, &x);
+            }
 
             // Zero out prompt region after each step (Python: x[..., :prompt_len] = 0)
             // The prompt region is preserved from prompt_x, not generated

@@ -9,6 +9,7 @@
 use anyhow::Result;
 use candle_core::{IndexOp, Tensor, D};
 use rand::Rng;
+use crate::utils::parity_dump;
 
 use super::unified_voice::UnifiedVoice;
 
@@ -230,6 +231,34 @@ fn cumulative_sum(tensor: &Tensor) -> Result<Tensor> {
     Tensor::from_slice(&cumsum, tensor.shape(), tensor.device()).map_err(Into::into)
 }
 
+fn adaptive_length_cap(text_len: usize, max_length: usize) -> usize {
+    // Used only if EOS is never emitted; keeps output length tied to text size.
+    ((text_len * 12) + 80).clamp(120, max_length)
+}
+
+fn ensure_text_prefill_tokens_once(
+    text_ids: &[u32],
+    start_text_token: u32,
+    stop_text_token: u32,
+) -> Vec<u32> {
+    if text_ids.len() >= 2
+        && text_ids.first().copied() == Some(start_text_token)
+        && text_ids.last().copied() == Some(stop_text_token)
+    {
+        return text_ids.to_vec();
+    }
+
+    let mut prefill = Vec::with_capacity(text_ids.len() + 2);
+    if text_ids.first().copied() != Some(start_text_token) {
+        prefill.push(start_text_token);
+    }
+    prefill.extend_from_slice(text_ids);
+    if text_ids.last().copied() != Some(stop_text_token) {
+        prefill.push(stop_text_token);
+    }
+    prefill
+}
+
 /// Generate mel codes autoregressively
 ///
 /// # Arguments
@@ -268,31 +297,34 @@ pub fn generate(
 
     // === PREFILL PHASE ===
     // Process conditioning through model first (if any)
-    let mut position = 0;
     if let Some(cond) = conditioning {
         // Process conditioning embeddings: (batch, cond_len, dim)
         let cond_len = cond.dim(1)?;
         for i in 0..cond_len {
             let emb = cond.i((.., i..i + 1, ..))?;
-            // Process as text token positionally, but use embedding directly
-            let _logits = model.forward_one_embedding(&emb, i, false)?;
+            // Python reference does not add positional embeddings to conditioning latents.
+            let _logits = model.forward_one_embedding_with_hidden_opts(&emb, i, false, false)?;
         }
-        position = cond_len;
         eprintln!("DEBUG generation: Prefilled {} conditioning frames", cond_len);
     }
 
     // Prefill: Process all text tokens to fill the KV cache
     // This gives the model context about what text to synthesize
     let text_ids_vec: Vec<u32> = text_ids.flatten_all()?.to_vec1()?;
-    eprintln!("DEBUG generation: text_ids = {:?}", &text_ids_vec[..text_ids_vec.len().min(20)]);
+    let prefill_text_ids = ensure_text_prefill_tokens_once(
+        &text_ids_vec,
+        model.start_text_token() as u32,
+        model.stop_text_token() as u32,
+    );
+    eprintln!("DEBUG generation: text_ids_prefill = {:?}", &prefill_text_ids[..prefill_text_ids.len().min(20)]);
 
     // Text tokens use positions 0, 1, 2, ... in their own positional space
-    for (i, &token) in text_ids_vec.iter().enumerate() {
+    for (i, &token) in prefill_text_ids.iter().enumerate() {
         let input_id = Tensor::new(&[[token]], device)?;
-        // Process as text token (is_mel=false), position is in text space
-        let _logits = model.forward_one(&input_id, position + i, false)?;
+        // Text positional embeddings in Python are independent of conditioning length.
+        let _logits = model.forward_one(&input_id, i, false)?;
     }
-    eprintln!("DEBUG generation: prefill complete, processed {} text tokens", text_ids_vec.len());
+    eprintln!("DEBUG generation: prefill complete, processed {} text tokens", prefill_text_ids.len());
 
     // === GENERATION PHASE ===
     // Mel tokens use their own positional space starting at 0
@@ -302,6 +334,7 @@ pub fn generate(
     let mut current_token = config.start_token as u32;
 
     // Generation loop
+    let mut reached_stop = false;
     for step in 0..config.max_length {
         // Create input tensor
         let input_id = Tensor::new(&[[current_token]], device)?;
@@ -334,8 +367,22 @@ pub fn generate(
         // Apply top-k
         let logits = sampler.apply_top_k(&logits, config.top_k)?;
 
-        // Apply top-p
+        // Apply top-p (with stop token protection)
         let logits = sampler.apply_top_p(&logits, config.top_p)?;
+        let logits = {
+            let mut logits_vec: Vec<f32> = logits.to_vec1()?;
+            if let Some(stop_logit) = logits_vec.get(config.stop_token).copied() {
+                if stop_logit.is_infinite() && stop_logit.is_sign_negative() {
+                    // Stop token was filtered; restore with small probability (~1%).
+                    logits_vec[config.stop_token] = -4.605; // ln(0.01)
+                    Tensor::from_slice(&logits_vec, logits.shape(), logits.device())?
+                } else {
+                    logits
+                }
+            } else {
+                logits
+            }
+        };
 
         // Sample next token
         let next_token = sampler.sample(&logits)?;
@@ -343,12 +390,27 @@ pub fn generate(
         // Check for stop token (but not before min_length)
         if next_token as usize == config.stop_token && step >= config.min_length {
             eprintln!("DEBUG generation: Stop token {} detected at step {}", next_token, step);
+            reached_stop = true;
             break;
         }
 
         generated_tokens.push(next_token);
         current_token = next_token;
         mel_position += 1;
+    }
+
+    if !reached_stop {
+        let capped_len = adaptive_length_cap(text_len, config.max_length);
+        if capped_len < generated_tokens.len() {
+            eprintln!(
+                "WARNING: EOS not emitted by max_length={} (stop_token={}). Applying adaptive fallback cap={} based on text_len={}",
+                config.max_length,
+                config.stop_token,
+                capped_len,
+                text_len
+            );
+            generated_tokens.truncate(capped_len);
+        }
     }
 
     eprintln!("DEBUG generation: Generated {} mel codes", generated_tokens.len());
@@ -390,32 +452,47 @@ pub fn generate_with_hidden(
     let mut sampler = Sampler::new();
     let mut generated_tokens: Vec<u32> = Vec::new();
     let mut hidden_states_list: Vec<Tensor> = Vec::new();
+    let parity_enabled = std::env::var_os("INDEXTTS2_PARITY_DIR").is_some();
+    let mut parity_cache_len_per_step: Vec<u32> = Vec::new();
+    let mut parity_last_step_idx: Option<usize> = None;
+    let mut parity_last_step_logits: Option<Tensor> = None;
 
     let text_len = text_ids.dim(1)?;
     let cond_len = conditioning.map(|c| c.dim(1).unwrap_or(0)).unwrap_or(0);
 
+    let text_ids_vec: Vec<u32> = text_ids.flatten_all()?.to_vec1()?;
+    let prefill_text_ids = ensure_text_prefill_tokens_once(
+        &text_ids_vec,
+        model.start_text_token() as u32,
+        model.stop_text_token() as u32,
+    );
+    parity_dump::dump_u32_slice("rust_gpt_text_ids", &prefill_text_ids);
+    if let Some(cond) = conditioning {
+        parity_dump::dump_tensor_f32("rust_gpt_conditioning", cond);
+    }
+    parity_dump::dump_usize("rust_gpt_text_len", text_len);
+    parity_dump::dump_usize("rust_gpt_cond_len", cond_len);
+
     // === PREFILL PHASE ===
-    let mut position = 0;
     if let Some(cond) = conditioning {
         let cond_len = cond.dim(1)?;
         for i in 0..cond_len {
             let emb = cond.i((.., i..i + 1, ..))?;
-            let _logits = model.forward_one_embedding(&emb, i, false)?;
+            let _logits = model.forward_one_embedding_with_hidden_opts(&emb, i, false, false)?;
         }
-        position = cond_len;
         eprintln!("DEBUG generate_with_hidden: Prefilled {} conditioning frames", cond_len);
     }
 
     // Prefill text tokens
-    let text_ids_vec: Vec<u32> = text_ids.flatten_all()?.to_vec1()?;
-    for (i, &token) in text_ids_vec.iter().enumerate() {
+    for (i, &token) in prefill_text_ids.iter().enumerate() {
         let input_id = Tensor::new(&[[token]], device)?;
-        let _logits = model.forward_one(&input_id, position + i, false)?;
+        let _logits = model.forward_one(&input_id, i, false)?;
     }
 
     // === GENERATION PHASE ===
     let mut mel_position = 0usize;
     let mut current_token = config.start_token as u32;
+    let mut reached_stop = false;
 
     for step in 0..config.max_length {
         let input_id = Tensor::new(&[[current_token]], device)?;
@@ -428,10 +505,20 @@ pub fn generate_with_hidden(
 
         // Debug on first step
         if step == 0 {
+            parity_dump::dump_tensor_f32("rust_gpt_logits_step0", &logits);
+            parity_dump::dump_tensor_f32("rust_gpt_hidden_step0", &hidden);
             let hidden_mean: f32 = hidden.mean_all()?.to_scalar()?;
             let hidden_var: f32 = hidden.var(D::Minus1)?.mean_all()?.to_scalar()?;
             eprintln!("DEBUG step 0: hidden_states shape={:?}, mean={:.4}, var={:.4}",
                 hidden.shape(), hidden_mean, hidden_var);
+        }
+        if step == 1 {
+            parity_dump::dump_tensor_f32("rust_gpt_logits_step1", &logits);
+        }
+        if parity_enabled {
+            parity_cache_len_per_step.push(model.kv_cache_current_len() as u32);
+            parity_last_step_idx = Some(step);
+            parity_last_step_logits = Some(logits.clone());
         }
 
         // Apply sampling
@@ -439,12 +526,28 @@ pub fn generate_with_hidden(
         let logits = sampler.apply_temperature(&logits, config.temperature)?;
         let logits = sampler.apply_top_k(&logits, config.top_k)?;
         let logits = sampler.apply_top_p(&logits, config.top_p)?;
+        let logits = {
+            let mut logits_vec: Vec<f32> = logits.to_vec1()?;
+            if let Some(stop_logit) = logits_vec.get(config.stop_token).copied() {
+                if stop_logit.is_infinite() && stop_logit.is_sign_negative() {
+                    // Stop token was filtered; restore with small probability (~1%).
+                    logits_vec[config.stop_token] = -4.605; // ln(0.01)
+                    Tensor::from_slice(&logits_vec, logits.shape(), logits.device())?
+                } else {
+                    logits
+                }
+            } else {
+                logits
+            }
+        };
+
 
         let next_token = sampler.sample(&logits)?;
 
         // Check for stop token
         if next_token as usize == config.stop_token && step >= config.min_length {
             eprintln!("DEBUG generate_with_hidden: Stop token at step {}", step);
+            reached_stop = true;
             break;
         }
 
@@ -453,6 +556,21 @@ pub fn generate_with_hidden(
         hidden_states_list.push(hidden.squeeze(1)?);
         current_token = next_token;
         mel_position += 1;
+    }
+
+    if !reached_stop {
+        let capped_len = adaptive_length_cap(text_len, config.max_length);
+        if capped_len < generated_tokens.len() {
+            eprintln!(
+                "WARNING: EOS not emitted by max_length={} (stop_token={}). Applying adaptive fallback cap={} based on text_len={}",
+                config.max_length,
+                config.stop_token,
+                capped_len,
+                text_len
+            );
+            generated_tokens.truncate(capped_len);
+            hidden_states_list.truncate(capped_len);
+        }
     }
 
     // Concatenate all hidden states along sequence dimension
@@ -465,6 +583,17 @@ pub fn generate_with_hidden(
 
     eprintln!("DEBUG generate_with_hidden: Generated {} codes, hidden_states shape={:?}",
         generated_tokens.len(), hidden_states.shape());
+
+    parity_dump::dump_u32_slice("rust_gpt_generated_tokens", &generated_tokens);
+    if parity_enabled {
+        if !parity_cache_len_per_step.is_empty() {
+            parity_dump::dump_u32_slice("rust_gpt_cache_len_per_step", &parity_cache_len_per_step);
+        }
+        if let (Some(step_idx), Some(step_logits)) = (parity_last_step_idx, parity_last_step_logits.as_ref()) {
+            parity_dump::dump_usize("rust_gpt_logits_step_last_index", step_idx);
+            parity_dump::dump_tensor_f32("rust_gpt_logits_step_last", step_logits);
+        }
+    }
 
     Ok((generated_tokens, hidden_states))
 }
@@ -486,24 +615,27 @@ pub fn generate_greedy(
     let mut generated_tokens: Vec<u32> = Vec::new();
 
     let _text_len = text_ids.dim(1)?;
-    let cond_len = conditioning.map(|c| c.dim(1).unwrap_or(0)).unwrap_or(0);
+    let _cond_len = conditioning.map(|c| c.dim(1).unwrap_or(0)).unwrap_or(0);
 
     // === PREFILL PHASE ===
-    let mut position = 0;
     if let Some(cond) = conditioning {
         let cond_len = cond.dim(1)?;
         for i in 0..cond_len {
             let emb = cond.i((.., i..i + 1, ..))?;
-            let _logits = model.forward_one_embedding(&emb, i, false)?;
+            let _logits = model.forward_one_embedding_with_hidden_opts(&emb, i, false, false)?;
         }
-        position = cond_len;
     }
 
     // Prefill text tokens
     let text_ids_vec: Vec<u32> = text_ids.flatten_all()?.to_vec1()?;
-    for (i, &token) in text_ids_vec.iter().enumerate() {
+    let prefill_text_ids = ensure_text_prefill_tokens_once(
+        &text_ids_vec,
+        model.start_text_token() as u32,
+        model.stop_text_token() as u32,
+    );
+    for (i, &token) in prefill_text_ids.iter().enumerate() {
         let input_id = Tensor::new(&[[token]], device)?;
-        let _logits = model.forward_one(&input_id, position + i, false)?;
+        let _logits = model.forward_one(&input_id, i, false)?;
     }
 
     // === GENERATION PHASE ===
@@ -606,5 +738,17 @@ mod tests {
         assert!((values[1] - 0.5).abs() < 0.001);
         assert!((values[2] - 0.6).abs() < 0.001);
         assert!((values[3] - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_ensure_text_prefill_tokens_once_adds_tokens() {
+        let prefill = ensure_text_prefill_tokens_once(&[11, 12, 13], 0, 1);
+        assert_eq!(prefill, vec![0, 11, 12, 13, 1]);
+    }
+
+    #[test]
+    fn test_ensure_text_prefill_tokens_once_keeps_wrapped_input() {
+        let prefill = ensure_text_prefill_tokens_once(&[0, 11, 12, 1], 0, 1);
+        assert_eq!(prefill, vec![0, 11, 12, 1]);
     }
 }

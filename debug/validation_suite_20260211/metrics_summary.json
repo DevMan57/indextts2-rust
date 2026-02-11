@@ -1,0 +1,60 @@
+{
+  "target": "debug/validation_suite_20260211",
+  "results": [
+    {
+      "file": "debug/validation_suite_20260211/emotion_audio.wav",
+      "sample_rate": 22050,
+      "duration_s": 6.3855,
+      "mean": -5e-06,
+      "rms": 0.207183,
+      "peak": 0.97995,
+      "low_ratio_lt180": 0.003225,
+      "low_ratio_lt300": 0.100447,
+      "high_ratio_gt6000": 0.385692
+    },
+    {
+      "file": "debug/validation_suite_20260211/emotion_audio_blend.wav",
+      "sample_rate": 22050,
+      "duration_s": 7.1634,
+      "mean": 1.3e-05,
+      "rms": 0.180747,
+      "peak": 0.97995,
+      "low_ratio_lt180": 0.008694,
+      "low_ratio_lt300": 0.134716,
+      "high_ratio_gt6000": 0.469378
+    },
+    {
+      "file": "debug/validation_suite_20260211/emotion_text.wav",
+      "sample_rate": 22050,
+      "duration_s": 7.5465,
+      "mean": 1e-05,
+      "rms": 0.250512,
+      "peak": 0.97995,
+      "low_ratio_lt180": 0.001059,
+      "low_ratio_lt300": 0.065094,
+      "high_ratio_gt6000": 0.344164
+    },
+    {
+      "file": "debug/validation_suite_20260211/emotion_vector.wav",
+      "sample_rate": 22050,
+      "duration_s": 8.1502,
+      "mean": 1e-06,
+      "rms": 0.202994,
+      "peak": 0.896393,
+      "low_ratio_lt180": 0.001869,
+      "low_ratio_lt300": 0.099242,
+      "high_ratio_gt6000": 0.312758
+    },
+    {
+      "file": "debug/validation_suite_20260211/voice_clone.wav",
+      "sample_rate": 22050,
+      "duration_s": 6.9892,
+      "mean": 7e-06,
+      "rms": 0.172938,
+      "peak": 0.97995,
+      "low_ratio_lt180": 0.020552,
+      "low_ratio_lt300": 0.080526,
+      "high_ratio_gt6000": 0.362359
+    }
+  ]
+}

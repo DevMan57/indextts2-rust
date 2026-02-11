@@ -1,4 +1,4 @@
-//! Conformer encoder for audio conditioning
+﻿//! Conformer encoder for audio conditioning
 //!
 //! Implements the Conformer architecture from:
 //! "Conformer: Convolution-augmented Transformer for Speech Recognition"
@@ -654,13 +654,14 @@ impl ConformerBlock {
     /// GPT format for layer i: conditioning_encoder.encoders.{i}.*
     fn from_gpt_tensors(
         tensors: &HashMap<String, Tensor>,
+        prefix_base: &str,
         layer_idx: usize,
         dim: usize,
         num_heads: usize,
         conv_kernel_size: usize,
         device: &Device,
     ) -> Result<Self> {
-        let prefix = format!("conditioning_encoder.encoders.{}", layer_idx);
+        let prefix = format!("{}.encoders.{}", prefix_base, layer_idx);
 
         // Feed-forward module (GPT has one ff, we use it for ff1)
         // Note: GPT conditioning_encoder uses norm_ff for the FF module
@@ -900,6 +901,15 @@ impl ConformerEncoder {
 
     /// Load from GPT checkpoint format (conditioning_encoder.*)
     pub fn load_from_gpt_tensors(&mut self, tensors: &HashMap<String, Tensor>) -> Result<()> {
+        self.load_from_gpt_tensors_with_prefix(tensors, "conditioning_encoder")
+    }
+
+    /// Load from GPT checkpoint format with custom prefix (e.g. emo_conditioning_encoder)
+    pub fn load_from_gpt_tensors_with_prefix(
+        &mut self,
+        tensors: &HashMap<String, Tensor>,
+        prefix: &str,
+    ) -> Result<()> {
         // Input projection - GPT uses a conv-based embed layer instead of linear
         // We'll use random weights for input_proj since the architecture differs
         let w = Tensor::randn(
@@ -913,7 +923,9 @@ impl ConformerEncoder {
 
         // Count available encoder layers in the checkpoint
         let num_layers = (0..20)
-            .take_while(|i| tensors.contains_key(&format!("conditioning_encoder.encoders.{}.self_attn.linear_q.weight", i)))
+            .take_while(|i| {
+                tensors.contains_key(&format!("{}.encoders.{}.self_attn.linear_q.weight", prefix, i))
+            })
             .count();
 
         eprintln!("  Found {} encoder layers in GPT checkpoint", num_layers);
@@ -927,6 +939,7 @@ impl ConformerEncoder {
         for i in 0..actual_blocks {
             match ConformerBlock::from_gpt_tensors(
                 tensors,
+                prefix,
                 i,
                 self.config.output_dim,
                 self.config.num_heads,
@@ -1046,7 +1059,7 @@ mod tests {
         let device = Device::Cpu;
         let x = Tensor::new(&[-1.0f32, 0.0, 1.0, 2.0], &device).unwrap();
         let out = swish(&x).unwrap();
-        // swish(-1) ≈ -0.27, swish(0) = 0, swish(1) ≈ 0.73, swish(2) ≈ 1.76
+        // swish(-1) â‰ˆ -0.27, swish(0) = 0, swish(1) â‰ˆ 0.73, swish(2) â‰ˆ 1.76
         assert_eq!(out.dims1().unwrap(), 4);
     }
 
@@ -1084,3 +1097,6 @@ mod tests {
         assert_eq!(head_dim_v, 64);
     }
 }
+
+
+

@@ -122,25 +122,46 @@ fn load_weight_normalized_linear(
     Ok(Linear::new(weight, bias))
 }
 
-/// Helper to load LayerNorm from tensors
-fn load_layer_norm(
-    tensors: &HashMap<String, Tensor>,
-    weight_key: &str,
-    dim: usize,
-    device: &Device,
-) -> Result<LayerNorm> {
-    let weight = match tensors.get(weight_key) {
-        Some(w) => w.clone(),
-        None => {
-            tracing::warn!(
-                "[DiT] Missing tensor '{}', using ones initialization",
-                weight_key
-            );
-            Tensor::ones((dim,), DType::F32, device)?
-        }
-    };
-    let bias = Tensor::zeros((dim,), DType::F32, device)?;
-    Ok(LayerNorm::new(weight, bias, 1e-5))
+/// RMSNorm used by gpt_fast Transformer blocks.
+/// Python reference:
+///   output = x * rsqrt(mean(x * x, dim=-1, keepdim=True) + eps) * weight
+#[derive(Clone)]
+struct RmsNorm {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl RmsNorm {
+    fn new(weight: Tensor, eps: f64) -> Self {
+        Self { weight, eps }
+    }
+
+    fn from_tensors(
+        tensors: &HashMap<String, Tensor>,
+        weight_key: &str,
+        dim: usize,
+        device: &Device,
+        eps: f64,
+    ) -> Result<Self> {
+        let weight = match tensors.get(weight_key) {
+            Some(w) => w.clone(),
+            None => {
+                tracing::warn!(
+                    "[DiT] Missing tensor '{}', using ones initialization",
+                    weight_key
+                );
+                Tensor::ones((dim,), DType::F32, device)?
+            }
+        };
+        Ok(Self::new(weight, eps))
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let denom = (x_f32.sqr()?.mean_keepdim(D::Minus1)? + self.eps)?.sqrt()?;
+        let normalized = x_f32.broadcast_div(&denom)?;
+        normalized.broadcast_mul(&self.weight).map_err(Into::into)
+    }
 }
 
 /// DiT configuration
@@ -318,16 +339,14 @@ fn silu(x: &Tensor) -> Result<Tensor> {
 /// Adaptive Layer Normalization (AdaLN)
 /// Checkpoint format: {prefix}.norm.weight, {prefix}.project_layer.weight/bias
 struct AdaLayerNorm {
-    norm: LayerNorm,
+    norm: RmsNorm,
     linear: Linear,
     dim: usize,
 }
 
 impl AdaLayerNorm {
     fn new(dim: usize, device: &Device) -> Result<Self> {
-        let ln_w = Tensor::ones((dim,), DType::F32, device)?;
-        let ln_b = Tensor::zeros((dim,), DType::F32, device)?;
-        let norm = LayerNorm::new(ln_w, ln_b, 1e-5);
+        let norm = RmsNorm::new(Tensor::ones((dim,), DType::F32, device)?, 1e-5);
 
         // Project conditioning to scale and shift
         let w = Tensor::randn(0.0f32, 0.02, (dim * 2, dim), device)?;
@@ -345,11 +364,12 @@ impl AdaLayerNorm {
         dim: usize,
         device: &Device,
     ) -> Result<Self> {
-        let norm = load_layer_norm(
+        let norm = RmsNorm::from_tensors(
             tensors,
             &format!("{}.norm.weight", prefix),
             dim,
             device,
+            1e-5,
         )?;
 
         let proj_key = format!("{}.project_layer.weight", prefix);
@@ -434,6 +454,44 @@ impl AdaLayerNorm {
         // NO +1 offset - the model was trained without it
         (normalized.broadcast_mul(&scale)?).broadcast_add(&shift).map_err(Into::into)
     }
+}
+
+/// Precompute rotary embedding frequencies as [seq_len, head_dim/2, 2] (cos, sin).
+fn precompute_freqs_cis(seq_len: usize, head_dim: usize, base: f32, device: &Device) -> Result<Tensor> {
+    let half = head_dim / 2;
+    let mut data = vec![0f32; seq_len * half * 2];
+    for pos in 0..seq_len {
+        for i in 0..half {
+            let theta = 1.0f32 / base.powf((2.0 * i as f32) / head_dim as f32);
+            let angle = pos as f32 * theta;
+            let idx = (pos * half + i) * 2;
+            data[idx] = angle.cos();
+            data[idx + 1] = angle.sin();
+        }
+    }
+    Tensor::from_slice(&data, (seq_len, half, 2), device).map_err(Into::into)
+}
+
+/// Apply rotary embedding to a tensor in [B, T, H, D] layout.
+fn apply_rotary_emb(x: &Tensor, freqs_cis: &Tensor) -> Result<Tensor> {
+    let (batch, seq_len, num_heads, head_dim) = x.dims4()?;
+    let half = head_dim / 2;
+    let in_dtype = x.dtype();
+
+    let x = x.to_dtype(DType::F32)?.reshape((batch, seq_len, num_heads, half, 2))?;
+    let freqs = freqs_cis.reshape((1, seq_len, 1, half, 2))?;
+
+    let x_real = x.i((.., .., .., .., 0))?;
+    let x_imag = x.i((.., .., .., .., 1))?;
+    let f_real = freqs.i((.., .., .., .., 0))?;
+    let f_imag = freqs.i((.., .., .., .., 1))?;
+
+    let out_real = x_real.broadcast_mul(&f_real)?.broadcast_sub(&x_imag.broadcast_mul(&f_imag)?)?;
+    let out_imag = x_imag.broadcast_mul(&f_real)?.broadcast_add(&x_real.broadcast_mul(&f_imag)?)?;
+
+    let out = Tensor::stack(&[out_real, out_imag], D::Minus1)?
+        .reshape((batch, seq_len, num_heads, head_dim))?;
+    out.to_dtype(in_dtype).map_err(Into::into)
 }
 
 /// Multi-head self-attention with fused QKV
@@ -595,6 +653,11 @@ impl MultiHeadAttention {
         let q = qkv.i((.., .., 0, .., ..))?.contiguous()?;
         let k = qkv.i((.., .., 1, .., ..))?.contiguous()?;
         let v = qkv.i((.., .., 2, .., ..))?.contiguous()?;
+
+        // Apply RoPE exactly like gpt_fast Attention.
+        let freqs_cis = precompute_freqs_cis(seq_len, self.head_dim, 10000.0, x.device())?;
+        let q = apply_rotary_emb(&q, &freqs_cis)?;
+        let k = apply_rotary_emb(&k, &freqs_cis)?;
 
         // Reshape to (batch, num_heads, seq_len, head_dim)
         let q = q.transpose(1, 2)?;
@@ -875,25 +938,84 @@ impl DiTBlock {
 
 /// WaveNet layer for post-transformer processing
 /// Each layer has dilated convolution with gated activation
+struct WavenetConv1d {
+    weight: Tensor,
+    bias: Option<Tensor>,
+    padding: usize,
+    dilation: usize,
+}
+
+impl WavenetConv1d {
+    fn new_random(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        dilation: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let weight = Tensor::randn(
+            0.0f32,
+            0.02,
+            (out_channels, in_channels, kernel_size),
+            device,
+        )?;
+        let bias = Some(Tensor::zeros((out_channels,), DType::F32, device)?);
+        let padding = ((kernel_size * dilation) - dilation) / 2;
+        Ok(Self {
+            weight,
+            bias,
+            padding,
+            dilation,
+        })
+    }
+
+    fn from_weight_norm(
+        weight_v: &Tensor,
+        weight_g: &Tensor,
+        bias: Option<Tensor>,
+        dilation: usize,
+    ) -> Result<Self> {
+        let weight = apply_weight_normalization(weight_v, weight_g)?;
+        let kernel_size = if weight.dims().len() == 3 {
+            weight.dim(2)?
+        } else {
+            1
+        };
+        let padding = ((kernel_size * dilation) - dilation) / 2;
+        Ok(Self {
+            weight,
+            bias,
+            padding,
+            dilation,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let y = x.conv1d(&self.weight, self.padding, 1, self.dilation, 1)?;
+        if let Some(ref bias) = self.bias {
+            y.broadcast_add(&bias.unsqueeze(0)?.unsqueeze(2)?)
+                .map_err(Into::into)
+        } else {
+            Ok(y)
+        }
+    }
+}
+
 struct WaveNetLayer {
-    in_conv: Linear,        // Input conv [1024, 512] (2*512 for gated)
-    res_skip_conv: Linear,  // Res/skip conv [1024, 512] or [512, 512] for last layer
+    in_conv: WavenetConv1d,
+    res_skip_conv: WavenetConv1d,
     dilation: usize,
     is_last: bool,          // Last layer only outputs skip (no residual)
 }
 
 impl WaveNetLayer {
     fn new(hidden_dim: usize, dilation: usize, is_last: bool, device: &Device) -> Result<Self> {
-        // in_conv: [2*hidden, hidden] for gated activation (tanh * sigmoid)
-        let w = Tensor::randn(0.0f32, 0.02, (hidden_dim * 2, hidden_dim), device)?;
-        let b = Tensor::zeros((hidden_dim * 2,), DType::F32, device)?;
-        let in_conv = Linear::new(w, Some(b));
+        // in_conv kernel is 5 in checkpoint/config.
+        let in_conv = WavenetConv1d::new_random(hidden_dim, hidden_dim * 2, 5, dilation, device)?;
 
-        // res_skip_conv: [2*hidden, hidden] for normal layers, [hidden, hidden] for last layer
+        // res_skip_conv is 1x1.
         let out_dim = if is_last { hidden_dim } else { hidden_dim * 2 };
-        let w = Tensor::randn(0.0f32, 0.02, (out_dim, hidden_dim), device)?;
-        let b = Tensor::zeros((out_dim,), DType::F32, device)?;
-        let res_skip_conv = Linear::new(w, Some(b));
+        let res_skip_conv = WavenetConv1d::new_random(hidden_dim, out_dim, 1, 1, device)?;
 
         Ok(Self { in_conv, res_skip_conv, dilation, is_last })
     }
@@ -906,27 +1028,13 @@ impl WaveNetLayer {
         is_last: bool,
         _device: &Device,
     ) -> Result<Self> {
-        // Load in_conv with weight normalization
-        // Shape [1024, 512, 5] for conv -> apply weight norm then take center tap
+        // Load in_conv with weight normalization (full conv kernel, no center-tap approximation).
         let in_weight_v = tensors.get(&format!("{}.weight_v", in_prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing {}.weight_v", in_prefix))?;
         let in_weight_g = tensors.get(&format!("{}.weight_g", in_prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing {}.weight_g", in_prefix))?;
         let in_bias = tensors.get(&format!("{}.bias", in_prefix)).cloned();
-
-        // Apply weight normalization first (on 3D tensor)
-        let in_weight_norm = apply_weight_normalization(in_weight_v, in_weight_g)?;
-
-        // For dilated conv weights [out, in, kernel], we use only center for linear approx
-        let in_weight = if in_weight_norm.dims().len() == 3 {
-            // [1024, 512, 5] -> take center tap for linear approximation
-            let kernel_size = in_weight_norm.dim(2)?;
-            let center = kernel_size / 2;
-            in_weight_norm.i((.., .., center))?.contiguous()?
-        } else {
-            in_weight_norm
-        };
-        let in_conv = Linear::new(in_weight, in_bias);
+        let in_conv = WavenetConv1d::from_weight_norm(in_weight_v, in_weight_g, in_bias, dilation)?;
 
         // Load res_skip_conv with weight normalization
         let res_weight_v = tensors.get(&format!("{}.weight_v", res_prefix))
@@ -934,31 +1042,22 @@ impl WaveNetLayer {
         let res_weight_g = tensors.get(&format!("{}.weight_g", res_prefix))
             .ok_or_else(|| anyhow::anyhow!("Missing {}.weight_g", res_prefix))?;
         let res_bias = tensors.get(&format!("{}.bias", res_prefix)).cloned();
-
-        // Apply weight normalization first
-        let res_weight_norm = apply_weight_normalization(res_weight_v, res_weight_g)?;
-
-        let res_weight = if res_weight_norm.dims().len() == 3 {
-            res_weight_norm.squeeze(2)?
-        } else {
-            res_weight_norm
-        };
-        let res_skip_conv = Linear::new(res_weight, res_bias);
+        let res_skip_conv = WavenetConv1d::from_weight_norm(res_weight_v, res_weight_g, res_bias, 1)?;
 
         Ok(Self { in_conv, res_skip_conv, dilation, is_last })
     }
 
     fn forward(&self, x: &Tensor, g: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (_batch, _seq_len, _hidden) = x.dims3()?;
+        let x_ct = x.transpose(1, 2)?; // [B, T, H] -> [B, H, T]
 
-        // Apply input conv (approximating dilated conv as linear)
-        let h = self.in_conv.forward(x)?;
+        // Apply input conv in channel-first space.
+        let h = self.in_conv.forward(&x_ct)?;
 
         // Add conditioning g
         let h = h.broadcast_add(g)?;
 
-        // Gated activation: tanh(h[:half]) * sigmoid(h[half:])
-        let chunks = h.chunk(2, D::Minus1)?;
+        // Gated activation: tanh(h[:half]) * sigmoid(h[half:]) across channel axis.
+        let chunks = h.chunk(2, 1)?;
         let tanh_part = chunks[0].tanh()?;
         let sigmoid_part = candle_nn::ops::sigmoid(&chunks[1])?;
         let h = (tanh_part * sigmoid_part)?;
@@ -968,18 +1067,18 @@ impl WaveNetLayer {
 
         if self.is_last {
             // Last layer: only skip output, no residual
-            // Output same x (no residual to add), skip is the full output
-            Ok((x.clone(), res_skip))
+            // Output same x (no residual to add), skip is the full output.
+            Ok((x.clone(), res_skip.transpose(1, 2)?))
         } else {
             // Normal layers: split into residual + skip
-            let res_skip_chunks = res_skip.chunk(2, D::Minus1)?;
-            let residual = &res_skip_chunks[0];
-            let skip = &res_skip_chunks[1];
+            let channels = x_ct.dim(1)?;
+            let residual = res_skip.narrow(1, 0, channels)?;
+            let skip = res_skip.narrow(1, channels, channels)?;
 
             // Residual connection
-            let output = (x + residual)?;
+            let output = (&x_ct + &residual)?;
 
-            Ok((output, skip.clone()))
+            Ok((output.transpose(1, 2)?, skip.transpose(1, 2)?))
         }
     }
 }
@@ -1002,7 +1101,7 @@ impl WaveNet {
 
         let mut layers = Vec::new();
         for i in 0..num_layers {
-            let dilation = 2usize.pow(i as u32);
+            let dilation = 1usize;
             let is_last = i == num_layers - 1;
             layers.push(WaveNetLayer::new(hidden_dim, dilation, is_last, device)?);
         }
@@ -1037,7 +1136,7 @@ impl WaveNet {
         // Load each layer
         let mut layers = Vec::new();
         for i in 0..num_layers {
-            let dilation = 2usize.pow(i as u32);
+            let dilation = 1usize;
             let is_last = i == num_layers - 1;
             let in_prefix = format!("{}.in_layers.{}.conv.conv", prefix, i);
             let res_prefix = format!("{}.res_skip_layers.{}.conv.conv", prefix, i);
@@ -1070,7 +1169,7 @@ impl WaveNet {
             // Extract conditioning for this layer
             let start = i * chunk_size;
             let g_layer = g_all.i((.., start..start + chunk_size))?;
-            let g_layer = g_layer.unsqueeze(1)?;  // [B, 1, 1024] for broadcasting
+            let g_layer = g_layer.unsqueeze(2)?;  // [B, 1024, 1] for broadcasting
 
             let (h_new, skip) = layer.forward(&h, &g_layer)?;
             h = h_new;
@@ -1100,7 +1199,7 @@ impl FinalLayer {
 
         let ln_w = Tensor::ones((dim,), DType::F32, device)?;
         let ln_b = Tensor::zeros((dim,), DType::F32, device)?;
-        let norm = LayerNorm::new(ln_w, ln_b, 1e-5);
+        let norm = LayerNorm::new(ln_w, ln_b, 1e-6);
 
         Ok(Self { adaln, linear, norm })
     }
@@ -1153,7 +1252,7 @@ impl FinalLayer {
 
         let ln_w = Tensor::ones((dim,), DType::F32, device)?;
         let ln_b = Tensor::zeros((dim,), DType::F32, device)?;
-        let norm = LayerNorm::new(ln_w, ln_b, 1e-5);
+        let norm = LayerNorm::new(ln_w, ln_b, 1e-6);
 
         Ok(Self { adaln, linear, norm })
     }
@@ -1202,8 +1301,8 @@ pub struct DiffusionTransformer {
     cond_embedder: Option<Linear>,
     /// Transformer blocks
     blocks: Vec<DiTBlock>,
-    /// Final layer norm (transformer.norm)
-    final_norm: Option<LayerNorm>,
+    /// Final adaptive norm (transformer.norm)
+    final_norm: Option<AdaLayerNorm>,
     /// Skip connection linear [512, 592] - concat x_res with original x (80 mel)
     skip_linear: Option<Linear>,
     /// Conv1 for WaveNet input [512, 512]
@@ -1299,10 +1398,8 @@ impl DiffusionTransformer {
             )?);
         }
 
-        // Final norm
-        let ln_w = Tensor::ones((dim,), DType::F32, &self.device)?;
-        let ln_b = Tensor::zeros((dim,), DType::F32, &self.device)?;
-        self.final_norm = Some(LayerNorm::new(ln_w, ln_b, 1e-5));
+        // Final adaptive norm (matches transformer.norm in gpt_fast)
+        self.final_norm = Some(AdaLayerNorm::new(dim, &self.device)?);
 
         // Post-transformer: skip_linear [512, 592] (concat x_res with original x)
         let w = Tensor::randn(0.0f32, 0.02, (dim, dim + in_ch), &self.device)?;  // 512 + 80 = 592
@@ -1441,15 +1538,15 @@ impl DiffusionTransformer {
         }
         eprintln!("  Loaded {} of {} transformer blocks", loaded_count, self.config.depth);
 
-        // Load final norm from transformer.norm
-        let final_norm = load_layer_norm(
+        // Load final adaptive norm from transformer.norm
+        let final_norm = AdaLayerNorm::from_tensors(
             &tensors,
-            &format!("{}.transformer.norm.norm.weight", prefix),
+            &format!("{}.transformer.norm", prefix),
             dim,
             &self.device,
         )?;
         self.final_norm = Some(final_norm);
-        eprintln!("  Loaded final norm");
+        eprintln!("  Loaded final adaptive norm");
 
         // ===== POST-TRANSFORMER COMPONENTS =====
 
@@ -1645,7 +1742,8 @@ impl DiffusionTransformer {
         let mut skip_features = Vec::new();
         let mid_point = self.config.depth / 2;
 
-        // 8. First half of transformer blocks (encoder) + 9. Second half (decoder)
+        // 8/9. Transformer blocks with UViT skip schedule matching gpt_fast:
+        // emit skips for i < mid_point, receive skips for i > mid_point.
         // Use atomic counter for single-shot debug
         use std::sync::atomic::{AtomicBool, Ordering};
         static PRINTED_BLOCKS: AtomicBool = AtomicBool::new(false);
@@ -1654,33 +1752,21 @@ impl DiffusionTransformer {
         let mut h = h;
         let mut block_rms = Vec::new();
 
-        for (i, block) in self.blocks.iter().take(mid_point).enumerate() {
-            h = block.forward(&h, &ada_cond, None)?;
-            if should_print {
-                let h_rms: f32 = h.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt();
-                block_rms.push((format!("enc{}", i), h_rms));
+        for (i, block) in self.blocks.iter().enumerate() {
+            let mut skip_in = None;
+            if self.config.uvit_skip_connection && i > mid_point {
+                skip_in = skip_features.pop();
             }
-            if self.config.uvit_skip_connection {
-                skip_features.push(h.clone());
-            }
-        }
 
-        // 9. Second half of transformer blocks (decoder) with skip connections
-        for (i, block) in self.blocks.iter().skip(mid_point).enumerate() {
-            let skip_tensor = if self.config.uvit_skip_connection && i < skip_features.len() {
-                let skip_idx = skip_features.len() - 1 - i;
-                if skip_idx < skip_features.len() {
-                    Some(&skip_features[skip_idx])
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            h = block.forward(&h, &ada_cond, skip_tensor)?;
+            h = block.forward(&h, &ada_cond, skip_in.as_ref())?;
+
             if should_print {
                 let h_rms: f32 = h.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt();
-                block_rms.push((format!("dec{}", i), h_rms));
+                block_rms.push((format!("blk{}", i), h_rms));
+            }
+
+            if self.config.uvit_skip_connection && i < mid_point {
+                skip_features.push(h.clone());
             }
         }
 
@@ -1689,9 +1775,9 @@ impl DiffusionTransformer {
             eprintln!("DEBUG DiT blocks: {}", rms_str.join(", "));
         }
 
-        // 10. Final transformer norm
+        // 10. Final transformer adaptive norm
         let h = if let Some(ref norm) = self.final_norm {
-            norm.forward(&h)?
+            norm.forward(&h, &ada_cond)?
         } else {
             h
         };

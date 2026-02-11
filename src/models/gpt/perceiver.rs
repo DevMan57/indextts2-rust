@@ -91,25 +91,38 @@ impl CrossAttention {
         tensors: &HashMap<String, Tensor>,
         prefix: &str,
         latent_dim: usize,    // 1280
-        attn_dim: usize,      // 512
+        attn_dim: usize,      // config default, may be overridden by checkpoint
         num_heads: usize,
         device: &Device,
     ) -> Result<Self> {
-        let head_dim = attn_dim / num_heads;  // 512/8 = 64
+        // Infer attention dim from checkpoint when available (emo perceiver uses 256).
+        let mut effective_attn_dim = attn_dim;
 
-        // Q projection: latent_dim -> attn_dim (1280 -> 512)
+        // Q projection: latent_dim -> attn_dim
         let q_key = format!("{}.to_q.weight", prefix);
         let q_proj = match tensors.get(&q_key) {
             Some(w) => {
+                let (out_dim, _in_dim) = w.dims2()?;
+                effective_attn_dim = out_dim;
                 eprintln!("    CrossAttn Q: {:?}", w.dims());
                 Linear::new(w.clone(), None)
             }
             None => {
                 tracing::warn!("[Perceiver] Missing '{}', using random initialization", q_key);
-                let w = Tensor::randn(0.0f32, 0.02, (attn_dim, latent_dim), device)?;
+                let w = Tensor::randn(0.0f32, 0.02, (effective_attn_dim, latent_dim), device)?;
                 Linear::new(w, None)
             }
         };
+
+        if effective_attn_dim % num_heads != 0 {
+            anyhow::bail!(
+                "Perceiver attn_dim {} is not divisible by num_heads {} for prefix {}",
+                effective_attn_dim,
+                num_heads,
+                prefix
+            );
+        }
+        let head_dim = effective_attn_dim / num_heads;
 
         // KV is fused as [2*attn_dim, latent_dim] = [1024, 1280]
         // We need to split it into K and V
@@ -125,8 +138,8 @@ impl CrossAttention {
         } else {
             // Fallback to random
             tracing::warn!("[Perceiver] Missing '{}', using random initialization", kv_key);
-            let w_k = Tensor::randn(0.0f32, 0.02, (attn_dim, latent_dim), device)?;
-            let w_v = Tensor::randn(0.0f32, 0.02, (attn_dim, latent_dim), device)?;
+            let w_k = Tensor::randn(0.0f32, 0.02, (effective_attn_dim, latent_dim), device)?;
+            let w_v = Tensor::randn(0.0f32, 0.02, (effective_attn_dim, latent_dim), device)?;
             (Linear::new(w_k, None), Linear::new(w_v, None))
         };
 
@@ -139,7 +152,7 @@ impl CrossAttention {
             }
             None => {
                 tracing::warn!("[Perceiver] Missing '{}', using random initialization", out_key);
-                let w = Tensor::randn(0.0f32, 0.02, (latent_dim, attn_dim), device)?;
+                let w = Tensor::randn(0.0f32, 0.02, (latent_dim, effective_attn_dim), device)?;
                 Linear::new(w, None)
             }
         };
@@ -151,7 +164,7 @@ impl CrossAttention {
             out_proj,
             num_heads,
             head_dim,
-            attn_dim,
+            attn_dim: effective_attn_dim,
         })
     }
 
@@ -447,6 +460,7 @@ impl PerceiverLayer {
     /// Note: GPT perceiver doesn't have self-attention between cross-attention and FFN
     fn from_gpt_tensors(
         tensors: &HashMap<String, Tensor>,
+        prefix: &str,
         layer_idx: usize,
         dim: usize,
         attn_dim: usize,
@@ -454,12 +468,12 @@ impl PerceiverLayer {
         _ff_mult: usize,
         device: &Device,
     ) -> Result<Self> {
-        let prefix = format!("perceiver_encoder.layers.{}", layer_idx);
+        let layer_prefix = format!("{}.layers.{}", prefix, layer_idx);
 
         // Cross-attention at .0
         let cross_attn = CrossAttention::from_gpt_tensors(
             tensors,
-            &format!("{}.0", prefix),
+            &format!("{}.0", layer_prefix),
             dim,
             attn_dim,
             num_heads,
@@ -469,7 +483,7 @@ impl PerceiverLayer {
         // SwiGLU FFN at .1
         let ffn = SwiGLUFeedForward::from_gpt_tensors(
             tensors,
-            &format!("{}.1", prefix),
+            &format!("{}.1", layer_prefix),
             dim,
             device,
         )?;
@@ -689,9 +703,18 @@ impl PerceiverResampler {
 
     /// Load from GPT checkpoint format (perceiver_encoder.*)
     pub fn load_from_gpt_tensors(&mut self, tensors: &HashMap<String, Tensor>) -> Result<()> {
-        // Load latents - GPT format: perceiver_encoder.latents [num_latents, dim]
-        let latents_key = "perceiver_encoder.latents";
-        if let Some(latents) = tensors.get(latents_key) {
+        self.load_from_gpt_tensors_with_prefix(tensors, "perceiver_encoder")
+    }
+
+    /// Load from GPT checkpoint format with custom prefix (e.g. emo_perceiver_encoder)
+    pub fn load_from_gpt_tensors_with_prefix(
+        &mut self,
+        tensors: &HashMap<String, Tensor>,
+        prefix: &str,
+    ) -> Result<()> {
+        // Load latents - GPT format: {prefix}.latents [num_latents, dim]
+        let latents_key = format!("{}.latents", prefix);
+        if let Some(latents) = tensors.get(&latents_key) {
             let (num_latents, dim) = latents.dims2()?;
             eprintln!("  Loaded latents: [{}, {}]", num_latents, dim);
             // Add batch dimension
@@ -710,12 +733,12 @@ impl PerceiverResampler {
             )?);
         }
 
-        // Load proj_context: context_dim (512) -> dim (1280)
-        let proj_context_key = "perceiver_encoder.proj_context.weight";
-        self.proj_context = match tensors.get(proj_context_key) {
+        // Load proj_context: context_dim -> dim
+        let proj_context_key = format!("{}.proj_context.weight", prefix);
+        self.proj_context = match tensors.get(&proj_context_key) {
             Some(weight) => {
-                let bias_key = "perceiver_encoder.proj_context.bias";
-                let bias = tensors.get(bias_key).cloned();
+                let bias_key = format!("{}.proj_context.bias", prefix);
+                let bias = tensors.get(&bias_key).cloned();
                 let (out_dim, in_dim) = weight.dims2()?;
                 // Update context_dim based on loaded weight
                 self.config.context_dim = in_dim;
@@ -729,8 +752,8 @@ impl PerceiverResampler {
         };
 
         // Load final norm (gamma only, no beta!)
-        let final_norm_key = "perceiver_encoder.norm.gamma";
-        self.final_norm = match tensors.get(final_norm_key) {
+        let final_norm_key = format!("{}.norm.gamma", prefix);
+        self.final_norm = match tensors.get(&final_norm_key) {
             Some(gamma) => {
                 let beta = Tensor::zeros_like(gamma)?;
                 eprintln!("  Loaded final_norm (gamma only): {:?}", gamma.dims());
@@ -744,7 +767,7 @@ impl PerceiverResampler {
 
         // Count available layers
         let num_layers = (0..10)
-            .take_while(|i| tensors.contains_key(&format!("perceiver_encoder.layers.{}.0.to_q.weight", i)))
+            .take_while(|i| tensors.contains_key(&format!("{}.layers.{}.0.to_q.weight", prefix, i)))
             .count();
 
         eprintln!("  Found {} perceiver layers in GPT checkpoint", num_layers);
@@ -756,6 +779,7 @@ impl PerceiverResampler {
             if i < num_layers {
                 match PerceiverLayer::from_gpt_tensors(
                     tensors,
+                    prefix,
                     i,
                     self.config.dim,
                     self.config.attn_dim,
@@ -780,7 +804,6 @@ impl PerceiverResampler {
                     }
                 }
             } else {
-                // Create random layer for remaining layers
                 let layer = PerceiverLayer::new_random(
                     self.config.dim,
                     self.config.attn_dim,
@@ -792,7 +815,7 @@ impl PerceiverResampler {
             }
         }
 
-        eprintln!("  Successfully loaded {} of {} perceiver layers", loaded_count, num_layers);
+        eprintln!("  Successfully loaded {} of {} perceiver layers", loaded_count, self.layers.len());
         self.weights_loaded = true;
         Ok(())
     }
@@ -928,3 +951,5 @@ mod tests {
         assert_eq!(out.dims3().unwrap(), (2, 32, 1280));
     }
 }
+
+

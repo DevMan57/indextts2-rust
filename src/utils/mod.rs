@@ -2,6 +2,10 @@
 //!
 //! This module provides common utilities used across the crate.
 
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+
 /// Tensor utilities
 pub mod tensor_utils {
     use candle_core::{DType, Device, Result, Tensor};
@@ -49,5 +53,125 @@ pub mod string_utils {
     /// Join a vector of strings with a separator
     pub fn join_strings(strings: &[String], separator: &str) -> String {
         strings.join(separator)
+    }
+}
+
+/// Optional parity dump helpers.
+///
+/// Enable by setting `INDEXTTS2_PARITY_DIR` to a writable directory.
+/// Files are written as `<name>.bin` + `<name>.json` metadata.
+pub mod parity_dump {
+    use super::*;
+    use candle_core::{DType, Tensor};
+    use serde_json::json;
+    use std::io::Write;
+
+    fn base_dir() -> Option<PathBuf> {
+        let value = env::var("INDEXTTS2_PARITY_DIR").ok()?;
+        if value.trim().is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(value))
+    }
+
+    fn write_blob(name: &str, dtype: &str, shape: &[usize], bytes: &[u8]) -> std::io::Result<()> {
+        let Some(dir) = base_dir() else {
+            return Ok(());
+        };
+        fs::create_dir_all(&dir)?;
+        let bin_path = dir.join(format!("{name}.bin"));
+        let meta_path = dir.join(format!("{name}.json"));
+
+        let mut f = fs::File::create(&bin_path)?;
+        f.write_all(bytes)?;
+
+        let meta = json!({
+            "name": name,
+            "dtype": dtype,
+            "shape": shape,
+            "numel": shape.iter().product::<usize>(),
+            "bin": bin_path.file_name().and_then(|s| s.to_str()).unwrap_or_default(),
+        });
+        fs::write(meta_path, serde_json::to_vec_pretty(&meta)?)?;
+        Ok(())
+    }
+
+    /// Dump a tensor as f32 binary + JSON metadata.
+    pub fn dump_tensor_f32(name: &str, tensor: &Tensor) {
+        let res = (|| -> anyhow::Result<()> {
+            let t = if tensor.dtype() == DType::F32 {
+                tensor.clone()
+            } else {
+                tensor.to_dtype(DType::F32)?
+            };
+            let shape = t.dims().to_vec();
+            let values: Vec<f32> = t.flatten_all()?.to_vec1()?;
+            let mut bytes = Vec::with_capacity(values.len() * 4);
+            for v in values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            write_blob(name, "f32", &shape, &bytes)?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            eprintln!("WARNING: parity dump failed for {name}: {e}");
+        }
+    }
+
+    /// Dump a tensor as i64 binary + JSON metadata.
+    pub fn dump_tensor_i64(name: &str, tensor: &Tensor) {
+        let res = (|| -> anyhow::Result<()> {
+            let t = if tensor.dtype() == DType::I64 {
+                tensor.clone()
+            } else {
+                tensor.to_dtype(DType::I64)?
+            };
+            let shape = t.dims().to_vec();
+            let values: Vec<i64> = t.flatten_all()?.to_vec1()?;
+            let mut bytes = Vec::with_capacity(values.len() * 8);
+            for v in values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            write_blob(name, "i64", &shape, &bytes)?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            eprintln!("WARNING: parity dump failed for {name}: {e}");
+        }
+    }
+
+    /// Dump raw u32 slice as binary + metadata.
+    pub fn dump_u32_slice(name: &str, values: &[u32]) {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        if let Err(e) = write_blob(name, "u32", &[values.len()], &bytes) {
+            eprintln!("WARNING: parity dump failed for {name}: {e}");
+        }
+    }
+
+    /// Dump a scalar usize as a tiny text file.
+    pub fn dump_usize(name: &str, value: usize) {
+        let Some(dir) = base_dir() else {
+            return;
+        };
+        if let Err(e) = fs::create_dir_all(&dir)
+            .and_then(|_| fs::write(dir.join(format!("{name}.txt")), value.to_string()))
+        {
+            eprintln!("WARNING: parity dump failed for {name}: {e}");
+        }
+    }
+
+    /// Dump a scalar f32 as a tiny text file.
+    pub fn dump_f32(name: &str, value: f32) {
+        let Some(dir) = base_dir() else {
+            return;
+        };
+        if let Err(e) = fs::create_dir_all(&dir)
+            .and_then(|_| fs::write(dir.join(format!("{name}.txt")), value.to_string()))
+        {
+            eprintln!("WARNING: parity dump failed for {name}: {e}");
+        }
     }
 }

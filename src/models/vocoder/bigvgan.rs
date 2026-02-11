@@ -195,18 +195,9 @@ impl ConvTranspose1d {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Use conv_transpose1d
-        let (batch, _channels, time) = x.dims3()?;
-        let _out_channels = self.weight.dim(1)?;
-
-        // Simple upsampling via repeat then convolve
-        let upsampled_len = time * self.stride;
-        let x_expanded = x.unsqueeze(3)?;
-        let x_expanded = x_expanded.repeat(&[1, 1, 1, self.stride])?;
-        let x_upsampled = x_expanded.reshape((batch, x.dim(1)?, upsampled_len))?;
-
-        // Apply convolution with transposed weight
-        let x = x_upsampled.conv1d(&self.weight.transpose(0, 1)?, self.padding, 1, 1, 1)?;
+        // True transposed convolution (matches PyTorch ConvTranspose1d).
+        // Candle signature: conv_transpose1d(kernel, padding, output_padding, stride, dilation, groups)
+        let x = x.conv_transpose1d(&self.weight, self.padding, 0, self.stride, 1, 1)?;
 
         if let Some(ref bias) = self.bias {
             let bias = bias.unsqueeze(0)?.unsqueeze(2)?;
@@ -586,13 +577,8 @@ impl BigVGAN {
             x.flatten_all()?.max(0)?.to_scalar::<f32>()?);
 
         // Upsampling with MRF blocks
+        // Upstream BigVGAN applies ConvTranspose directly (no extra fixed Snake here).
         for (i, (up, mrf)) in self.ups.iter().zip(self.mrf_blocks.iter()).enumerate() {
-            x = snake_activation_scalar(&x, 1.0)?;
-            eprintln!("DEBUG: BigVGAN {} after snake: mean={:.4}, min={:.4}, max={:.4}",
-                i,
-                x.mean_all()?.to_scalar::<f32>()?,
-                x.flatten_all()?.min(0)?.to_scalar::<f32>()?,
-                x.flatten_all()?.max(0)?.to_scalar::<f32>()?);
             x = up.forward(&x)?;
             eprintln!("DEBUG: BigVGAN {} after up: mean={:.4}, min={:.4}, max={:.4}",
                 i,

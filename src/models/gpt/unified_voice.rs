@@ -17,6 +17,8 @@
 use anyhow::Result;
 use candle_core::{Device, Tensor, DType, D, IndexOp};
 use candle_nn::{Linear, Module, VarBuilder, LayerNorm};
+use crate::config::{GptConfig, ConditionModuleConfig};
+use crate::utils::parity_dump;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -125,11 +127,21 @@ impl DecoderLayer {
         x: &Tensor,
         cache: &mut LayerCache,
         causal_mask: bool,
+        trace_prefix: Option<&str>,
     ) -> Result<Tensor> {
+        let dump = |suffix: &str, tensor: &Tensor| {
+            if let Some(prefix) = trace_prefix {
+                let name = format!("{prefix}_{suffix}");
+                parity_dump::dump_tensor_f32(&name, tensor);
+            }
+        };
+        dump("input", x);
+
         let (batch_size, seq_len, _) = x.dims3()?;
 
         // Pre-norm self-attention
         let normed = self.attn_layer_norm.forward(x)?;
+        dump("ln1", &normed);
 
         let q = self.q_proj.forward(&normed)?;
         let k = self.k_proj.forward(&normed)?;
@@ -153,6 +165,9 @@ impl DecoderLayer {
 
         // KV cache
         let (k, v) = cache.append(&k, &v)?;
+        dump("q", &q);
+        dump("k", &k);
+        dump("v", &v);
         let kv_len = k.dim(2)?;
 
         // Attention
@@ -160,6 +175,7 @@ impl DecoderLayer {
         let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
         let attn = q.matmul(&k_t)?;
         let attn = (attn / scale)?;
+        dump("attn_scores_pre_mask", &attn);
 
         // Causal mask
         let attn = if causal_mask {
@@ -170,6 +186,7 @@ impl DecoderLayer {
         } else {
             attn
         };
+        dump("attn_scores_post_mask", &attn);
 
         let attn = candle_nn::ops::softmax(&attn, D::Minus1)?;
         let v = v.contiguous()?;
@@ -179,6 +196,7 @@ impl DecoderLayer {
             .transpose(1, 2)?
             .contiguous()?
             .reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
+        dump("attn_out_pre_out_proj", &attn_out);
         let attn_out = self.out_proj.forward(&attn_out)?;
 
         // Residual connection
@@ -186,12 +204,15 @@ impl DecoderLayer {
 
         // Pre-norm FFN
         let normed = self.ffn_layer_norm.forward(&x)?;
+        dump("ln2", &normed);
         let ffn_out = self.fc1.forward(&normed)?;
         let ffn_out = ffn_out.gelu_erf()?;
         let ffn_out = self.fc2.forward(&ffn_out)?;
 
         // Residual connection
-        (&x + ffn_out).map_err(Into::into)
+        let out = (&x + ffn_out)?;
+        dump("out", &out);
+        Ok(out)
     }
 }
 
@@ -245,7 +266,33 @@ impl Default for UnifiedVoiceConfig {
         }
     }
 }
+fn default_condition_module() -> ConditionModuleConfig {
+    ConditionModuleConfig {
+        output_size: 512,
+        linear_units: 2048,
+        attention_heads: 8,
+        num_blocks: 6,
+        input_layer: "conv2d2".to_string(),
+        perceiver_mult: 2,
+    }
+}
 
+fn default_emo_condition_module() -> ConditionModuleConfig {
+    ConditionModuleConfig {
+        output_size: 512,
+        linear_units: 1024,
+        attention_heads: 4,
+        num_blocks: 4,
+        input_layer: "conv2d2".to_string(),
+        perceiver_mult: 2,
+    }
+}
+
+fn ff_expansion_from(cfg: &ConditionModuleConfig) -> usize {
+    let denom = cfg.output_size.max(1);
+    let exp = cfg.linear_units / denom;
+    if exp == 0 { 4 } else { exp }
+}
 /// Unified Voice Model
 ///
 /// GPT-2 based autoregressive model for mel code generation.
@@ -253,6 +300,9 @@ impl Default for UnifiedVoiceConfig {
 pub struct UnifiedVoice {
     device: Device,
     config: UnifiedVoiceConfig,
+    condition_type: String,
+    cond_config: ConditionModuleConfig,
+    emo_cond_config: ConditionModuleConfig,
     /// Text token embedding
     text_embedding: Option<Tensor>,
     /// Mel code embedding
@@ -263,10 +313,21 @@ pub struct UnifiedVoice {
     conformer: Option<ConformerEncoder>,
     /// Perceiver resampler
     perceiver: Option<PerceiverResampler>,
+    /// Emotion conditioning conformer
+    emo_conformer: Option<ConformerEncoder>,
+    /// Emotion perceiver resampler
+    emo_perceiver: Option<PerceiverResampler>,
+    /// Emotion vector projection layers
+    emovec_layer: Option<Linear>,
+    emo_layer: Option<Linear>,
+    /// Speed embedding (2 entries)
+    speed_emb: Option<Tensor>,
     /// Decoder layers
     decoder_layers: Vec<DecoderLayer>,
     /// Final layer norm
     final_layer_norm: Option<LayerNorm>,
+    /// Extra norm before mel head (Python inference `final_norm`)
+    lm_head_norm: Option<LayerNorm>,
     /// Output projection (to mel codes)
     lm_head: Option<Linear>,
     /// KV cache for generation
@@ -280,19 +341,52 @@ impl UnifiedVoice {
     pub fn new(device: &Device) -> Result<Self> {
         Self::with_config(UnifiedVoiceConfig::default(), device)
     }
+    /// Create from model config
+    pub fn from_gpt_config(cfg: &GptConfig, device: &Device) -> Result<Self> {
+        let uv_cfg = UnifiedVoiceConfig {
+            model_dim: cfg.model_dim,
+            num_layers: cfg.layers,
+            num_heads: cfg.heads,
+            max_mel_tokens: cfg.max_mel_tokens,
+            max_text_tokens: cfg.max_text_tokens,
+            number_text_tokens: cfg.number_text_tokens,
+            number_mel_codes: cfg.number_mel_codes,
+            start_mel_token: cfg.start_mel_token,
+            stop_mel_token: cfg.stop_mel_token,
+            start_text_token: cfg.start_text_token,
+            stop_text_token: cfg.stop_text_token,
+        };
+        let mut model = Self::with_config(uv_cfg, device)?;
+        model.condition_type = cfg.condition_type.clone();
+        model.cond_config = cfg.condition_module.clone();
+        model.emo_cond_config = cfg.emo_condition_module.clone();
+        Ok(model)
+    }
 
     /// Create with custom config
     pub fn with_config(config: UnifiedVoiceConfig, device: &Device) -> Result<Self> {
+        let condition_type = "conformer_perceiver".to_string();
+        let cond_config = default_condition_module();
+        let emo_cond_config = default_emo_condition_module();
         Ok(Self {
             device: device.clone(),
             config,
+            condition_type,
+            cond_config,
+            emo_cond_config,
             text_embedding: None,
             mel_embedding: None,
             pos_embedding: None,
             conformer: None,
             perceiver: None,
+            emo_conformer: None,
+            emo_perceiver: None,
+            emovec_layer: None,
+            emo_layer: None,
+            speed_emb: None,
             decoder_layers: Vec::new(),
             final_layer_norm: None,
+            lm_head_norm: None,
             lm_head: None,
             kv_cache: None,
             weights_loaded: false,
@@ -333,14 +427,15 @@ impl UnifiedVoice {
             &self.device,
         )?);
 
-        // Conformer encoder - outputs 512 dim, Perceiver proj_context handles 512->1280
+        // Conformer encoder - outputs condition_module.output_size dim
+        let cond_ff = ff_expansion_from(&self.cond_config);
         let mut conformer = ConformerEncoder::with_config(
             ConformerConfig {
-                input_dim: 80,
-                output_dim: 512,  // Conformer internal dim is 512, NOT model_dim (1280)
-                num_blocks: 6,
-                num_heads: 8,
-                ff_expansion: 4,
+                input_dim: 1024,
+                output_dim: self.cond_config.output_size,
+                num_blocks: self.cond_config.num_blocks,
+                num_heads: self.cond_config.attention_heads,
+                ff_expansion: cond_ff,
                 conv_kernel_size: 31,
             },
             &self.device,
@@ -352,17 +447,60 @@ impl UnifiedVoice {
         let mut perceiver = PerceiverResampler::with_config(
             PerceiverConfig {
                 dim,
-                context_dim: 512,
+                context_dim: self.cond_config.output_size,
                 num_latents: 32,
-                num_heads: 8,
+                num_heads: self.cond_config.attention_heads,
                 num_layers: 2,
-                ff_mult: 4,
-                attn_dim: 512,
+                ff_mult: self.cond_config.perceiver_mult,
+                attn_dim: self.cond_config.output_size,
             },
             &self.device,
         )?;
         perceiver.initialize_random()?;
         self.perceiver = Some(perceiver);
+
+        // Emotion conditioning encoder + perceiver
+        let emo_ff = ff_expansion_from(&self.emo_cond_config);
+        let mut emo_conformer = ConformerEncoder::with_config(
+            ConformerConfig {
+                input_dim: 1024,
+                output_dim: self.emo_cond_config.output_size,
+                num_blocks: self.emo_cond_config.num_blocks,
+                num_heads: self.emo_cond_config.attention_heads,
+                ff_expansion: emo_ff,
+                conv_kernel_size: 31,
+            },
+            &self.device,
+        )?;
+        emo_conformer.initialize_random()?;
+        self.emo_conformer = Some(emo_conformer);
+
+        let mut emo_perceiver = PerceiverResampler::with_config(
+            PerceiverConfig {
+                dim: 1024,
+                context_dim: self.emo_cond_config.output_size,
+                num_latents: 1,
+                num_heads: self.emo_cond_config.attention_heads,
+                num_layers: 2,
+                ff_mult: self.emo_cond_config.perceiver_mult,
+                attn_dim: self.emo_cond_config.output_size,
+            },
+            &self.device,
+        )?;
+        emo_perceiver.initialize_random()?;
+        self.emo_perceiver = Some(emo_perceiver);
+
+        // Emotion projection layers
+        let emovec_w = Tensor::randn(0.0f32, 0.02, (dim, 1024), &self.device)?;
+        let emovec_b = Tensor::zeros((dim,), DType::F32, &self.device)?;
+        self.emovec_layer = Some(Linear::new(emovec_w, Some(emovec_b)));
+
+        let emo_w = Tensor::randn(0.0f32, 0.02, (dim, dim), &self.device)?;
+        let emo_b = Tensor::zeros((dim,), DType::F32, &self.device)?;
+        self.emo_layer = Some(Linear::new(emo_w, Some(emo_b)));
+
+        // Speed embedding (2 entries)
+        self.speed_emb = Some(Tensor::zeros((2, dim), DType::F32, &self.device)?);
 
         // Decoder layers
         self.decoder_layers.clear();
@@ -375,6 +513,11 @@ impl UnifiedVoice {
         let ln_w = Tensor::ones((dim,), DType::F32, &self.device)?;
         let ln_b = Tensor::zeros((dim,), DType::F32, &self.device)?;
         self.final_layer_norm = Some(LayerNorm::new(ln_w, ln_b, 1e-5));
+
+        // lm_head norm
+        let lm_ln_w = Tensor::ones((dim,), DType::F32, &self.device)?;
+        let lm_ln_b = Tensor::zeros((dim,), DType::F32, &self.device)?;
+        self.lm_head_norm = Some(LayerNorm::new(lm_ln_w, lm_ln_b, 1e-5));
 
         // LM head
         let lm_w = Tensor::randn(0.0f32, 0.02, (self.config.number_mel_codes, dim), &self.device)?;
@@ -449,6 +592,14 @@ impl UnifiedVoice {
             &self.device,
         )?);
 
+        self.lm_head_norm = Some(load_layer_norm(
+            &tensors,
+            "final_norm.weight",
+            Some("final_norm.bias"),
+            1e-5,
+            &self.device,
+        )?);
+
         // LM head (mel_head) - need to transpose for candle
         let mel_head_weight = tensors
             .get("mel_head.weight")
@@ -461,6 +612,8 @@ impl UnifiedVoice {
         // For now, initialize them randomly (they'll need their own load methods)
         self.load_conformer_weights(&tensors)?;
         self.load_perceiver_weights(&tensors)?;
+        self.load_emo_conditioning_weights(&tensors)?;
+        self.load_emo_layers(&tensors)?;
 
         self.weights_loaded = true;
         eprintln!("GPT weights loaded successfully: {} layers", self.config.num_layers);
@@ -470,22 +623,21 @@ impl UnifiedVoice {
     /// Load conformer encoder weights
     #[allow(unused_variables)]
     fn load_conformer_weights(&mut self, tensors: &HashMap<String, Tensor>) -> Result<()> {
-        // Initialize conformer - outputs 512 dim, Perceiver proj_context handles 512->1280
+        let cond_ff = ff_expansion_from(&self.cond_config);
         let mut conformer = ConformerEncoder::with_config(
             ConformerConfig {
-                input_dim: 80,
-                output_dim: 512,  // Conformer internal dim is 512, NOT model_dim (1280)
-                num_blocks: 6,
-                num_heads: 8,
-                ff_expansion: 4,
+                input_dim: 1024,
+                output_dim: self.cond_config.output_size,
+                num_blocks: self.cond_config.num_blocks,
+                num_heads: self.cond_config.attention_heads,
+                ff_expansion: cond_ff,
                 conv_kernel_size: 31,
             },
             &self.device,
         )?;
 
         // Load actual conformer weights from tensors
-        // Keys: conditioning_encoder.encoders.{n}.*
-        conformer.load_from_gpt_tensors(tensors)?;
+        conformer.load_from_gpt_tensors_with_prefix(tensors, "conditioning_encoder")?;
         self.conformer = Some(conformer);
         Ok(())
     }
@@ -498,19 +650,19 @@ impl UnifiedVoice {
         let mut perceiver = PerceiverResampler::with_config(
             PerceiverConfig {
                 dim: self.config.model_dim,
-                context_dim: 512,
+                context_dim: self.cond_config.output_size,
                 num_latents: 32,
-                num_heads: 8,  // 512 attn_dim / 8 heads = 64 head_dim
+                num_heads: self.cond_config.attention_heads,
                 num_layers: 2,
-                ff_mult: 4,
-                attn_dim: 512,
+                ff_mult: self.cond_config.perceiver_mult,
+                attn_dim: self.cond_config.output_size,
             },
             &self.device,
         )?;
 
         if has_perceiver {
             // Load from GPT tensors using perceiver's own loader
-            perceiver.load_from_gpt_tensors(tensors)?;
+            perceiver.load_from_gpt_tensors_with_prefix(tensors, "perceiver_encoder")?;
             eprintln!("  Perceiver weights loaded from checkpoint");
         } else {
             eprintln!("  Warning: No perceiver_encoder weights found, using random");
@@ -518,6 +670,86 @@ impl UnifiedVoice {
         }
 
         self.perceiver = Some(perceiver);
+        Ok(())
+    }
+
+    fn load_emo_conditioning_weights(&mut self, tensors: &HashMap<String, Tensor>) -> Result<()> {
+        let has_emo = tensors.keys().any(|k| k.starts_with("emo_conditioning_encoder"));
+        let emo_ff = ff_expansion_from(&self.emo_cond_config);
+        let mut emo_conformer = ConformerEncoder::with_config(
+            ConformerConfig {
+                input_dim: 1024,
+                output_dim: self.emo_cond_config.output_size,
+                num_blocks: self.emo_cond_config.num_blocks,
+                num_heads: self.emo_cond_config.attention_heads,
+                ff_expansion: emo_ff,
+                conv_kernel_size: 31,
+            },
+            &self.device,
+        )?;
+
+        if has_emo {
+            emo_conformer.load_from_gpt_tensors_with_prefix(tensors, "emo_conditioning_encoder")?;
+        } else {
+            emo_conformer.initialize_random()?;
+        }
+        self.emo_conformer = Some(emo_conformer);
+
+        let mut emo_perceiver = PerceiverResampler::with_config(
+            PerceiverConfig {
+                dim: 1024,
+                context_dim: self.emo_cond_config.output_size,
+                num_latents: 1,
+                num_heads: self.emo_cond_config.attention_heads,
+                num_layers: 2,
+                ff_mult: self.emo_cond_config.perceiver_mult,
+                attn_dim: self.emo_cond_config.output_size,
+            },
+            &self.device,
+        )?;
+
+        if tensors.keys().any(|k| k.starts_with("emo_perceiver_encoder")) {
+            emo_perceiver.load_from_gpt_tensors_with_prefix(tensors, "emo_perceiver_encoder")?;
+        } else {
+            emo_perceiver.initialize_random()?;
+        }
+
+        self.emo_perceiver = Some(emo_perceiver);
+        Ok(())
+    }
+
+    fn load_emo_layers(&mut self, tensors: &HashMap<String, Tensor>) -> Result<()> {
+        let dim = self.config.model_dim;
+
+        // emovec_layer: 1024 -> model_dim
+        let emovec_w = tensors.get("emovec_layer.weight").cloned();
+        let emovec_b = tensors.get("emovec_layer.bias").cloned();
+        if let Some(w) = emovec_w {
+            self.emovec_layer = Some(Linear::new(w, emovec_b));
+        } else {
+            let w = Tensor::randn(0.0f32, 0.02, (dim, 1024), &self.device)?;
+            let b = Tensor::zeros((dim,), DType::F32, &self.device)?;
+            self.emovec_layer = Some(Linear::new(w, Some(b)));
+        }
+
+        // emo_layer: model_dim -> model_dim
+        let emo_w = tensors.get("emo_layer.weight").cloned();
+        let emo_b = tensors.get("emo_layer.bias").cloned();
+        if let Some(w) = emo_w {
+            self.emo_layer = Some(Linear::new(w, emo_b));
+        } else {
+            let w = Tensor::randn(0.0f32, 0.02, (dim, dim), &self.device)?;
+            let b = Tensor::zeros((dim,), DType::F32, &self.device)?;
+            self.emo_layer = Some(Linear::new(w, Some(b)));
+        }
+
+        // speed_emb: [2, model_dim]
+        if let Some(w) = tensors.get("speed_emb.weight") {
+            self.speed_emb = Some(w.clone());
+        } else {
+            self.speed_emb = Some(Tensor::zeros((2, dim), DType::F32, &self.device)?);
+        }
+
         Ok(())
     }
 
@@ -532,6 +764,14 @@ impl UnifiedVoice {
         if let Some(ref mut cache) = self.kv_cache {
             cache.reset();
         }
+    }
+
+    /// Current sequence length stored in the KV cache.
+    pub fn kv_cache_current_len(&self) -> usize {
+        self.kv_cache
+            .as_ref()
+            .map(|cache| cache.current_seq_len())
+            .unwrap_or(0)
     }
 
     /// Get text embeddings
@@ -577,6 +817,61 @@ impl UnifiedVoice {
 
         // Perceiver resamples to fixed length conditioning (proj_context: 512->1280)
         perceiver.forward(&encoded)
+    }
+    /// Process emotion conditioning through emo conformer + perceiver
+    pub fn process_emo_conditioning(&self, features: &Tensor) -> Result<Tensor> {
+        let conformer = self
+            .emo_conformer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Emotion conformer not initialized"))?;
+        let perceiver = self
+            .emo_perceiver
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Emotion perceiver not initialized"))?;
+
+        let encoded = conformer.forward(features, None)?;
+        perceiver.forward(&encoded)
+    }
+
+    fn get_emovec(&self, features: &Tensor) -> Result<Tensor> {
+        let emovec_layer = self
+            .emovec_layer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("emovec_layer not initialized"))?;
+        let emo_layer = self
+            .emo_layer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("emo_layer not initialized"))?;
+
+        let cond = self.process_emo_conditioning(features)?; // expected (B, 1, 1024)
+        let cond_shape = cond.shape().clone();
+        let cond = cond.squeeze(1)?;
+
+        let emovec_w_shape = emovec_layer.weight().shape().clone();
+        let emo_w_shape = emo_layer.weight().shape().clone();
+        eprintln!(
+            "DEBUG get_emovec: cond={:?}, squeezed={:?}, emovec_w={:?}, emo_w={:?}",
+            cond_shape,
+            cond.shape(),
+            emovec_w_shape,
+            emo_w_shape
+        );
+
+        let emovec = emovec_layer
+            .forward(&cond)
+            .map_err(|e| anyhow::anyhow!("emovec_layer forward failed (cond={:?}, weight={:?}): {}", cond.shape(), emovec_w_shape, e))?;
+        emo_layer
+            .forward(&emovec)
+            .map_err(|e| anyhow::anyhow!("emo_layer forward failed (emovec={:?}, weight={:?}): {}", emovec.shape(), emo_w_shape, e))
+    }
+
+    /// Merge emotion vector from base and emotion features
+    pub fn merge_emovec(&self, base_features: &Tensor, emo_features: &Tensor, alpha: f32) -> Result<Tensor> {
+        let base_vec = self.get_emovec(base_features)?;
+        let emo_vec = self.get_emovec(emo_features)?;
+        // base + alpha * (emo - base)
+        let delta = (&emo_vec - &base_vec)?;
+        (&base_vec + (delta * alpha as f64)?).map_err(Into::into)
     }
 
     /// Embed mel codes to continuous features
@@ -671,7 +966,7 @@ impl UnifiedVoice {
 
         // Process through decoder layers
         for (i, layer) in self.decoder_layers.iter().enumerate() {
-            hidden = layer.forward(&hidden, &mut layer_caches[i], true)?;
+            hidden = layer.forward(&hidden, &mut layer_caches[i], true, None)?;
         }
 
         // Final layer norm
@@ -748,7 +1043,12 @@ impl UnifiedVoice {
         position: usize,
         is_mel: bool,
     ) -> Result<Tensor> {
-        let (logits, _) = self.forward_one_embedding_with_hidden(embedding, position, is_mel)?;
+        let (logits, _) = self.forward_one_embedding_with_hidden_opts(
+            embedding,
+            position,
+            is_mel,
+            true,
+        )?;
         Ok(logits)
     }
 
@@ -758,6 +1058,17 @@ impl UnifiedVoice {
         embedding: &Tensor,
         position: usize,
         is_mel: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_one_embedding_with_hidden_opts(embedding, position, is_mel, true)
+    }
+
+    /// Forward pass for generation using pre-computed embeddings with explicit positional embedding control.
+    pub fn forward_one_embedding_with_hidden_opts(
+        &mut self,
+        embedding: &Tensor,
+        position: usize,
+        is_mel: bool,
+        add_position_embedding: bool,
     ) -> Result<(Tensor, Tensor)> {
         if !self.weights_loaded {
             let batch = embedding.dim(0)?;
@@ -780,36 +1091,75 @@ impl UnifiedVoice {
         }
 
         let mut hidden = embedding.clone();
+        let trace_step = is_mel
+            && position <= 1
+            && std::env::var_os("INDEXTTS2_PARITY_DIR").is_some();
+        let trace_step_prefix = trace_step.then(|| format!("rust_gpt_step{position}"));
+        let parity_trace_blocks = std::env::var("INDEXTTS2_PARITY_TRACE_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2);
 
         // Add positional embedding
-        let text_pos_size = self.config.max_text_tokens + 2;
-        let pos_index = if is_mel {
-            text_pos_size + position
-        } else {
-            position
-        };
-        let pos_emb = self.embed_pos(1, pos_index)?;
-        let pos_emb = pos_emb.unsqueeze(0)?.broadcast_as(hidden.shape())?;
-        hidden = (hidden + pos_emb)?;
+        if add_position_embedding {
+            let text_pos_size = self.config.max_text_tokens + 2;
+            let pos_index = if is_mel {
+                // Match Python GPT2InferenceModel cached-decode indexing:
+                // step0 (start token) uses mel pos 0, then step1 uses mel pos 2.
+                // (Python computes this as attention_mask_len - mel_len.)
+                let mel_pos = if position == 0 { 0 } else { position + 1 };
+                text_pos_size + mel_pos
+            } else {
+                position
+            };
+            let pos_emb = self.embed_pos(1, pos_index)?;
+            let pos_emb = pos_emb.unsqueeze(0)?.broadcast_as(hidden.shape())?;
+            hidden = (hidden + pos_emb)?;
+        }
 
         // Process through decoder layers with KV cache
         let cache = self.kv_cache.as_mut().unwrap();
         for (i, layer) in self.decoder_layers.iter().enumerate() {
             let layer_cache = cache.get_layer_cache_mut(i)
                 .ok_or_else(|| anyhow::anyhow!("Layer cache {} not found", i))?;
-            hidden = layer.forward(&hidden, layer_cache, true)?;
+            let trace_prefix = if i < parity_trace_blocks {
+                trace_step_prefix
+                    .as_ref()
+                    .map(|step_prefix| format!("{step_prefix}_block_{i:02}"))
+            } else {
+                None
+            };
+            hidden = layer.forward(&hidden, layer_cache, true, trace_prefix.as_deref())?;
         }
 
         // Final layer norm
+        if let Some(step_prefix) = trace_step_prefix.as_deref() {
+            let name = format!("{step_prefix}_pre_final_ln");
+            parity_dump::dump_tensor_f32(&name, &hidden);
+        }
         if let Some(ref ln) = self.final_layer_norm {
             hidden = ln.forward(&hidden)?;
         }
+        if let Some(step_prefix) = trace_step_prefix.as_deref() {
+            let name = format!("{step_prefix}_post_final_ln");
+            parity_dump::dump_tensor_f32(&name, &hidden);
+        }
 
-        // Save hidden states before projection
+        // Save hidden states after the transformer's final norm (used for latent features).
         let hidden_states = hidden.clone();
 
-        // Squeeze out sequence dimension and project to logits
-        let hidden = hidden.squeeze(1)?;
+        // Python inference applies an additional `final_norm` before mel_head projection.
+        // Mirror that behavior for logits parity while keeping `hidden_states` as post-ln_f.
+        let mut hidden = hidden.squeeze(1)?;
+        if let Some(ref ln) = self.lm_head_norm {
+            hidden = ln.forward(&hidden)?;
+        } else if let Some(ref ln) = self.final_layer_norm {
+            hidden = ln.forward(&hidden)?;
+        }
+        if let Some(step_prefix) = trace_step_prefix.as_deref() {
+            let name = format!("{step_prefix}_pre_lm_head");
+            parity_dump::dump_tensor_f32(&name, &hidden);
+        }
         let logits = if let Some(ref lm_head) = self.lm_head {
             lm_head.forward(&hidden)?
         } else {
@@ -819,6 +1169,10 @@ impl UnifiedVoice {
                 &self.device,
             )?
         };
+        if let Some(step_prefix) = trace_step_prefix.as_deref() {
+            let name = format!("{step_prefix}_post_lm_head");
+            parity_dump::dump_tensor_f32(&name, &logits);
+        }
 
         Ok((logits, hidden_states))
     }
@@ -842,6 +1196,16 @@ impl UnifiedVoice {
     /// Get start token
     pub fn start_token(&self) -> usize {
         self.config.start_mel_token
+    }
+
+    /// Get text start token
+    pub fn start_text_token(&self) -> usize {
+        self.config.start_text_token
+    }
+
+    /// Get text stop token
+    pub fn stop_text_token(&self) -> usize {
+        self.config.stop_text_token
     }
 
     /// Check if initialized
@@ -951,3 +1315,21 @@ mod tests {
         assert_eq!(logits.dims3().unwrap(), (1, 2, 8194));
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
